@@ -46,7 +46,11 @@ type PodConfig struct {
 // network device allocated to a Pod. This includes network interface settings,
 // routes for the Pod's network namespace, and RDMA configurations.
 type DeviceConfig struct {
-	Claim types.NamespacedName `json:"claim"`
+	Claim    types.NamespacedName `json:"claim"`
+	ClaimUID types.UID            `json:"claimUID,omitempty"`
+
+	// RuntimeAttached records whether the NRI hook attached this device.
+	RuntimeAttached bool `json:"runtimeAttached,omitempty"`
 
 	// DeviceSnapshot contains the original discovered ResourceSlice Device structure,
 	// which includes the device's identifying attributes and capacity.

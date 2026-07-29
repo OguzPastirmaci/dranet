@@ -40,13 +40,16 @@ const (
 	PathGetDeviceConfig      = "/GetDeviceConfig"
 	PathGetProfileConfig     = "/GetProfileConfig"
 	PathReleaseProfileConfig = "/ReleaseProfileConfig"
+	PathPostAttachDevice     = "/PostAttachDevice"
+	PathPreDetachDevice      = "/PreDetachDevice"
 	PathHealth               = "/health"
 )
 
 // Capabilities represents the functionality supported by the webhook server.
 type Capabilities struct {
-	CloudProvider   bool `json:"cloudProvider"`
-	ProfileProvider bool `json:"profileProvider"`
+	CloudProvider           bool `json:"cloudProvider"`
+	ProfileProvider         bool `json:"profileProvider"`
+	DeviceLifecycleProvider bool `json:"deviceLifecycleProvider"`
 }
 
 // API Contracts (JSON payloads)
@@ -69,6 +72,10 @@ func (p *WebhookProvider) HasCloudProvider() bool {
 
 func (p *WebhookProvider) HasProfileProvider() bool {
 	return p.caps.ProfileProvider
+}
+
+func (p *WebhookProvider) HasDeviceLifecycleProvider() bool {
+	return p.caps.DeviceLifecycleProvider
 }
 
 func newWebhookClient(endpoint string) (*http.Client, *url.URL, error) {
@@ -127,6 +134,7 @@ func OnWebhook(ctx context.Context, endpoint string) bool {
 
 var _ cloudprovider.CloudInstance = &WebhookProvider{}
 var _ cloudprovider.ProfileProvider = &WebhookProvider{}
+var _ cloudprovider.DeviceLifecycleProvider = &WebhookProvider{}
 
 // NewWebhookProvider initializes the HTTP client and fetches capabilities.
 func NewWebhookProvider(ctx context.Context, endpoint string) (*WebhookProvider, error) {
@@ -166,22 +174,25 @@ func NewWebhookProvider(ctx context.Context, endpoint string) (*WebhookProvider,
 	return p, nil
 }
 
-// helper to perform the HTTP POST
-func (p *WebhookProvider) post(path string, reqPayload interface{}, respObj interface{}) error {
+// post performs an HTTP POST against a supported provider endpoint.
+func (p *WebhookProvider) post(ctx context.Context, path string, reqPayload interface{}, respObj interface{}) error {
 	if (path == PathGetDeviceAttributes || path == PathGetDeviceConfig) && !p.caps.CloudProvider {
 		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
 	}
 	if (path == PathGetProfileConfig || path == PathReleaseProfileConfig) && !p.caps.ProfileProvider {
 		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
 	}
+	if (path == PathPostAttachDevice || path == PathPreDetachDevice) && !p.caps.DeviceLifecycleProvider {
+		return fmt.Errorf("webhook returned HTTP %d: Not Implemented", http.StatusNotImplemented)
+	}
 
 	body, err := json.Marshal(reqPayload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal request: %v", err)
+		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	reqURL := p.baseURL.JoinPath(path).String()
-	req, err := http.NewRequest(http.MethodPost, reqURL, bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
@@ -189,7 +200,7 @@ func (p *WebhookProvider) post(path string, reqPayload interface{}, respObj inte
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("webhook request failed: %v", err)
+		return fmt.Errorf("webhook request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -200,7 +211,7 @@ func (p *WebhookProvider) post(path string, reqPayload interface{}, respObj inte
 
 	if respObj != nil {
 		if err := json.NewDecoder(resp.Body).Decode(respObj); err != nil {
-			return fmt.Errorf("failed to decode webhook response: %v", err)
+			return fmt.Errorf("failed to decode webhook response: %w", err)
 		}
 	}
 	return nil
@@ -209,7 +220,7 @@ func (p *WebhookProvider) post(path string, reqPayload interface{}, respObj inte
 // GetDeviceAttributes asks the webhook for physical hardware attributes.
 func (p *WebhookProvider) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	var resp map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
-	err := p.post(PathGetDeviceAttributes, id, &resp)
+	err := p.post(context.Background(), PathGetDeviceAttributes, id, &resp)
 	if err != nil {
 		klog.Errorf("Webhook GetDeviceAttributes failed: %v", err)
 		return nil
@@ -221,7 +232,7 @@ func (p *WebhookProvider) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers
 // GetDeviceConfig asks the webhook for baseline physical network settings (like MTU).
 func (p *WebhookProvider) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
 	var config apis.NetworkConfig
-	err := p.post(PathGetDeviceConfig, id, &config)
+	err := p.post(context.Background(), PathGetDeviceConfig, id, &config)
 	if err != nil {
 		klog.Errorf("Webhook GetDeviceConfig failed: %v", err)
 		return nil
@@ -238,7 +249,7 @@ func (p *WebhookProvider) GetProfileConfig(id cloudprovider.DeviceIdentifiers, c
 	}
 
 	var respConfig apis.NetworkConfig
-	err := p.post(PathGetProfileConfig, req, &respConfig)
+	err := p.post(context.Background(), PathGetProfileConfig, req, &respConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +264,13 @@ func (p *WebhookProvider) ReleaseProfileConfig(id cloudprovider.DeviceIdentifier
 		Config:   config,
 	}
 
-	return p.post(PathReleaseProfileConfig, req, nil)
+	return p.post(context.Background(), PathReleaseProfileConfig, req, nil)
 }
 
+func (p *WebhookProvider) PostAttachDevice(ctx context.Context, req cloudprovider.DeviceLifecycleRequest) error {
+	return p.post(ctx, PathPostAttachDevice, req, nil)
+}
 
+func (p *WebhookProvider) PreDetachDevice(ctx context.Context, req cloudprovider.DeviceLifecycleRequest) error {
+	return p.post(ctx, PathPreDetachDevice, req, nil)
+}

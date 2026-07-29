@@ -249,6 +249,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				Namespace: claim.Namespace,
 				Name:      claim.Name,
 			},
+			ClaimUID:                    claim.UID,
 			NetworkInterfaceConfigInPod: netconf,
 			DeviceSnapshot:              deviceSnapshot,
 		}

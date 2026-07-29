@@ -28,22 +28,25 @@ import (
 
 // TestSetupProviders tests the initialization behavior of the dranet providers.
 // We avoid testing actual cloud providers (like GCE, AWS, Azure, OKE) here because
-// their discovery functions poll real metadata servers. Running these tests on a VM 
+// their discovery functions poll real metadata servers. Running these tests on a VM
 // in one of those clouds would generate false positives or unpredictable behavior.
-// Instead, we use the webhook provider to inject our own local mock server, allowing 
+// Instead, we use the webhook provider to inject our own local mock server, allowing
 // us to assert the business logic consistently.
 func TestSetupProviders(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name              string
-		cloudProviderHint string
-		profileProvider   string
-		webhookURL        string // explicit URL to bypass mock server creation
-		webhookCaps       *webhook.Capabilities
-		expectCloudInst   bool
-		expectProfProv    bool
-		expectErr         bool
+		name                      string
+		cloudProviderHint         string
+		profileProvider           string
+		webhookURL                string // explicit URL to bypass mock server creation
+		deviceLifecycleProvider   string
+		deviceLifecycleWebhookURL string
+		webhookCaps               *webhook.Capabilities
+		expectCloudInst           bool
+		expectProfProv            bool
+		expectLifecycleProv       bool
+		expectErr                 bool
 	}{
 		{
 			name:              "No providers",
@@ -134,14 +137,72 @@ func TestSetupProviders(t *testing.T) {
 			expectProfProv:    false,
 			expectErr:         true, // profProv fails
 		},
+		{
+			name:                      "Device lifecycle webhook empty URL hard fails",
+			cloudProviderHint:         "NONE",
+			profileProvider:           "none",
+			deviceLifecycleProvider:   "webhook",
+			deviceLifecycleWebhookURL: "empty",
+			expectErr:                 true,
+		},
+		{
+			name:                      "Device lifecycle webhook init failure hard fails",
+			cloudProviderHint:         "NONE",
+			profileProvider:           "none",
+			deviceLifecycleProvider:   "webhook",
+			deviceLifecycleWebhookURL: "://invalid-url",
+			expectErr:                 true,
+		},
+		{
+			name:                    "Device lifecycle capability missing fails hard",
+			cloudProviderHint:       "NONE",
+			profileProvider:         "none",
+			deviceLifecycleProvider: "webhook",
+			webhookCaps:             &webhook.Capabilities{CloudProvider: true},
+			expectErr:               true,
+		},
+		{
+			name:                    "Lifecycle-only webhook succeeds",
+			cloudProviderHint:       "NONE",
+			profileProvider:         "none",
+			deviceLifecycleProvider: "webhook",
+			webhookCaps:             &webhook.Capabilities{DeviceLifecycleProvider: true},
+			expectLifecycleProv:     true,
+		},
+		{
+			name:                    "Unknown device lifecycle provider fails",
+			cloudProviderHint:       "NONE",
+			profileProvider:         "none",
+			deviceLifecycleProvider: "unknown",
+			expectErr:               true,
+		},
+		{
+			name:                    "Cloud profile and lifecycle providers are independent",
+			cloudProviderHint:       "webhook",
+			profileProvider:         "webhook",
+			deviceLifecycleProvider: "webhook",
+			webhookCaps: &webhook.Capabilities{
+				CloudProvider:           true,
+				ProfileProvider:         true,
+				DeviceLifecycleProvider: true,
+			},
+			expectCloudInst:     true,
+			expectProfProv:      true,
+			expectLifecycleProv: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			endpoint := tt.webhookURL
+			lifecycleEndpoint := tt.deviceLifecycleWebhookURL
 			if endpoint == "empty" {
 				endpoint = ""
-			} else if tt.webhookCaps != nil {
+			}
+			if lifecycleEndpoint == "empty" {
+				lifecycleEndpoint = ""
+			}
+			if tt.webhookCaps != nil {
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if r.URL.Path == webhook.PathHealth {
 						json.NewEncoder(w).Encode(tt.webhookCaps)
@@ -150,10 +211,22 @@ func TestSetupProviders(t *testing.T) {
 					w.WriteHeader(http.StatusOK)
 				}))
 				defer srv.Close()
-				endpoint = srv.URL
+				if endpoint == "" {
+					endpoint = srv.URL
+				}
+				if lifecycleEndpoint == "" {
+					lifecycleEndpoint = srv.URL
+				}
 			}
 
-			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint)
+			cloudInst, profProv, lifecycleProv, err := setupProviders(
+				ctx,
+				tt.cloudProviderHint,
+				tt.profileProvider,
+				endpoint,
+				tt.deviceLifecycleProvider,
+				lifecycleEndpoint,
+			)
 
 			if (err != nil) != tt.expectErr {
 				t.Errorf("expected error: %v, got: %v", tt.expectErr, err)
@@ -165,6 +238,10 @@ func TestSetupProviders(t *testing.T) {
 
 			if (profProv != nil) != tt.expectProfProv {
 				t.Errorf("expected profProv: %v, got: %v", tt.expectProfProv, profProv != nil)
+			}
+
+			if (lifecycleProv != nil) != tt.expectLifecycleProv {
+				t.Errorf("expected lifecycleProv: %v, got: %v", tt.expectLifecycleProv, lifecycleProv != nil)
 			}
 		})
 	}

@@ -30,6 +30,7 @@ import (
 	resourceapply "k8s.io/client-go/applyconfigurations/resource/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/set"
+	"sigs.k8s.io/dranet/pkg/cloudprovider"
 )
 
 // NRI hooks into the container runtime, the lifecycle of the Pod seen here is local to the runtime
@@ -43,20 +44,37 @@ func (np *NetworkDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox
 	logger := klog.FromContext(ctx)
 	logger.Info("Synchronized state with the runtime", "pods", len(pods), "containers", len(containers))
 
-	// livePodNetNs map tracks live pods by UID and their network namespace paths.
-	livePodNetNs := make(map[types.UID]string)
+	// livePods tracks live pods by UID so lifecycle state can be replayed.
+	livePods := make(map[types.UID]*api.PodSandbox)
 	for _, pod := range pods {
 		podLogger := klog.LoggerWithValues(logger, "pod", klog.KRef(pod.Namespace, pod.Name), "podUID", pod.Uid)
 		podLogger.Info("Synchronize Pod")
 		podLogger.V(2).Info("Pod network details", "netns", getNetworkNamespace(pod), "ips", pod.GetIps())
-		livePodNetNs[types.UID(pod.Uid)] = getNetworkNamespace(pod)
+		livePods[types.UID(pod.Uid)] = pod
 	}
 
-	// Process stored pods: update NetNS for live pods.
+	var replayRequests []cloudprovider.DeviceLifecycleRequest
 	for _, storedUID := range np.podConfigStore.ListPods() {
-		if ns, isLive := livePodNetNs[storedUID]; isLive {
-			np.podConfigStore.SetPodNetNs(storedUID, ns)
+		pod, isLive := livePods[storedUID]
+		if !isLive {
+			continue
 		}
+		ns := getNetworkNamespace(pod)
+		np.podConfigStore.SetPodNetNs(storedUID, ns)
+		if np.deviceLifecycleProvider == nil || ns == "" {
+			continue
+		}
+		podConfig, ok := np.podConfigStore.GetPodConfig(storedUID)
+		if !ok {
+			continue
+		}
+		replayRequests = append(
+			replayRequests,
+			np.deviceLifecycleRequests(pod, np.attachedLifecycleDevices(podConfig), ns)...,
+		)
+	}
+	if err := np.postAttachRequests(ctx, replayRequests); err != nil {
+		logger.Error(err, "Synchronize failed to replay PostAttachDevice")
 	}
 
 	return nil, nil
@@ -156,6 +174,7 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 
 	// Track all the status updates needed for the resource claims of the pod.
 	statusUpdates := map[types.NamespacedName]*resourceapply.ResourceClaimStatusApplyConfiguration{}
+	attachedDevices := make([]lifecycleDevice, 0, len(podConfig.DeviceConfigs))
 	// Process the configurations of the ResourceClaim
 	for deviceName, config := range podConfig.DeviceConfigs {
 		logger.V(4).Info("RunPodSandbox processing device", "device", deviceName, "config", fmt.Sprintf("%#v", config))
@@ -194,6 +213,10 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 			}
 		}
 
+		if ifName != "" || (!np.rdmaSharedMode && config.RDMADevice.LinkDev != "") {
+			attachedDevices = append(attachedDevices, lifecycleDevice{name: deviceName, config: config})
+		}
+
 		// Block 3: Status conditions for IB-only devices (no netdev).
 		// In exclusive RDMA mode the RDMA link was moved above; in shared mode
 		// char-device injection (createContainer) is sufficient. Either way the
@@ -210,6 +233,24 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 
 		resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
 	}
+
+	if np.deviceLifecycleProvider != nil {
+		if err := np.setRuntimeAttached(types.UID(pod.GetUid()), attachedDevices, true); err != nil {
+			np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "DeviceLifecycleStateFailed",
+				"failed to persist attached device state for pod %s/%s: %v", pod.GetNamespace(), pod.GetName(), err)
+			np.rollbackDeviceAttach(ctx, pod, attachedDevices, ns)
+			return err
+		}
+	}
+
+	// Notify the lifecycle provider after all device moves and configuration complete.
+	if err := np.postAttachDevices(ctx, pod, attachedDevices, ns); err != nil {
+		np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "PostAttachDeviceFailed",
+			"device lifecycle provider rejected one or more devices for pod %s/%s: %v", pod.GetNamespace(), pod.GetName(), err)
+		np.rollbackDeviceAttach(ctx, pod, attachedDevices, ns)
+		return err
+	}
+
 	// do not block the handler to update the status
 	for claim, status := range statusUpdates {
 		resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).WithStatus(status)
@@ -378,12 +419,20 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		// some version of containerd does not send the network namespace information on this hook so
 		// we workaround it using the local copy we have in the db to associate interfaces with Pods via
 		// the network namespace id.
-		if podConfig.NetNS == "" {
-			logger.Info("StopPodSandbox: network namespace for DRANET pod is unknown; skipping explicit device detach and relying on kernel netns teardown")
-			return nil
-		}
 		ns = podConfig.NetNS
 	}
+
+	devices := np.attachedLifecycleDevices(podConfig)
+	if err := np.preDetachDevices(ctx, pod, devices, ns); err != nil {
+		logger.Error(err, "PreDetachDevice notifications failed")
+		np.eventRecorder.Eventf(podObjectRef(pod), v1.EventTypeWarning, "PreDetachDeviceFailed",
+			"device lifecycle provider failed to release one or more devices for pod %s/%s: %v", pod.GetNamespace(), pod.GetName(), err)
+	}
+	if ns == "" {
+		logger.Info("StopPodSandbox: network namespace for DRANET pod is unknown; skipping explicit device detach and relying on kernel netns teardown")
+		return nil
+	}
+
 	needsRescan := false
 	for deviceName, config := range podConfig.DeviceConfigs {
 		// Move the RDMA device back to the host namespace BEFORE the netdev.
@@ -412,6 +461,12 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 
 		if needsRescanAfterDetach(rdmaDetached, netdevDetached) {
 			needsRescan = true
+		}
+		if config.RuntimeAttached && np.deviceDetachComplete(config, rdmaDetached, netdevDetached) {
+			device := lifecycleDevice{name: deviceName, config: config}
+			if err := np.setRuntimeAttached(types.UID(pod.GetUid()), []lifecycleDevice{device}, false); err != nil {
+				logger.Error(err, "Failed to clear runtime attachment state", "device", deviceName)
+			}
 		}
 	}
 	if needsRescan {
@@ -447,10 +502,11 @@ func (np *NetworkDriver) RemovePodSandbox(ctx context.Context, pod *api.PodSandb
 		nriPluginRequestsTotal.WithLabelValues(methodRemovePodSandbox, status).Inc()
 		nriPluginRequestsLatencySeconds.WithLabelValues(methodRemovePodSandbox, status).Observe(time.Since(start).Seconds())
 	}()
-	if _, ok := np.podConfigStore.GetPodConfig(types.UID(pod.GetUid())); !ok {
+	podConfig, ok := np.podConfigStore.GetPodConfig(types.UID(pod.GetUid()))
+	if !ok {
 		return nil
 	}
-	err := np.removePodSandbox(ctx, pod)
+	err := np.removePodSandbox(ctx, pod, podConfig)
 	if err != nil {
 		status = statusFailed
 	} else {
@@ -459,7 +515,15 @@ func (np *NetworkDriver) RemovePodSandbox(ctx context.Context, pod *api.PodSandb
 	return err
 }
 
-func (np *NetworkDriver) removePodSandbox(_ context.Context, pod *api.PodSandbox) error {
+func (np *NetworkDriver) removePodSandbox(ctx context.Context, pod *api.PodSandbox, podConfig PodConfig) error {
+	logger := klog.FromContext(ctx)
+	ns := getNetworkNamespace(pod)
+	if ns == "" {
+		ns = podConfig.NetNS
+	}
+	if err := np.preDetachDevices(ctx, pod, np.attachedLifecycleDevices(podConfig), ns); err != nil {
+		logger.Error(err, "RemovePodSandbox fallback PreDetachDevice notifications failed")
+	}
 	return nil
 }
 

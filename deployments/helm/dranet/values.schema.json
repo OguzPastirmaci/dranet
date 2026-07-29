@@ -86,10 +86,89 @@
         },
         "cloudProviderHint": {
           "type": "string",
-          "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "NONE"],
+          "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "webhook", "NONE"],
           "description": "Hint for the cloud provider plugin; auto-detected if unset"
+        },
+        "profileProvider": {
+          "type": "string",
+          "enum": ["cloud", "webhook", "none"],
+          "description": "Provider for user profile configuration"
+        },
+        "webhookURL": {
+          "type": "string",
+          "description": "HTTP, HTTPS, or Unix socket URL for cloud and profile webhook providers"
+        },
+        "deviceLifecycleProvider": {
+          "type": "string",
+          "enum": ["webhook", "none"],
+          "description": "Provider for node-local device lifecycle hooks"
+        },
+        "deviceLifecycleWebhookURL": {
+          "type": "string",
+          "description": "HTTP, HTTPS, or Unix socket URL for the device lifecycle webhook provider"
+        },
+        "deviceLifecycleTimeout": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(ns|us|ms|s|m|h)$",
+          "description": "Positive integer duration with one unit for each concurrent device lifecycle webhook batch, e.g. '1s', '500ms'"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "cloudProviderHint": {
+                "const": "webhook"
+              }
+            },
+            "required": ["cloudProviderHint"]
+          },
+          "then": {
+            "properties": {
+              "webhookURL": {
+                "minLength": 1
+              }
+            },
+            "required": ["webhookURL"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profileProvider": {
+                "const": "webhook"
+              }
+            },
+            "required": ["profileProvider"]
+          },
+          "then": {
+            "properties": {
+              "webhookURL": {
+                "minLength": 1
+              }
+            },
+            "required": ["webhookURL"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "deviceLifecycleProvider": {
+                "const": "webhook"
+              }
+            },
+            "required": ["deviceLifecycleProvider"]
+          },
+          "then": {
+            "properties": {
+              "deviceLifecycleWebhookURL": {
+                "minLength": 1
+              }
+            },
+            "required": ["deviceLifecycleWebhookURL"]
+          }
+        }
+      ]
     },
     "nodeSelector": {
       "type": "object"
@@ -99,6 +178,18 @@
     },
     "tolerations": {
       "type": "array"
+    },
+    "extraVolumeMounts": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraVolumes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
     },
     "resources": {
       "type": "object",

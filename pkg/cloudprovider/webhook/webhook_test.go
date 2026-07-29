@@ -19,13 +19,16 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 )
@@ -35,16 +38,18 @@ func TestWebhookCapabilitiesAndPost(t *testing.T) {
 	id := cloudprovider.DeviceIdentifiers{}
 
 	tests := []struct {
-		name                 string
-		caps                 Capabilities
-		expectCloudSuccess   bool
-		expectProfileSuccess bool
+		name                   string
+		caps                   Capabilities
+		expectCloudSuccess     bool
+		expectProfileSuccess   bool
+		expectLifecycleSuccess bool
 	}{
 		{
-			name:                 "Both capabilities enabled",
-			caps:                 Capabilities{CloudProvider: true, ProfileProvider: true},
-			expectCloudSuccess:   true,
-			expectProfileSuccess: true,
+			name:                   "All capabilities enabled",
+			caps:                   Capabilities{CloudProvider: true, ProfileProvider: true, DeviceLifecycleProvider: true},
+			expectCloudSuccess:     true,
+			expectProfileSuccess:   true,
+			expectLifecycleSuccess: true,
 		},
 		{
 			name:                 "Only CloudProvider enabled",
@@ -59,8 +64,15 @@ func TestWebhookCapabilitiesAndPost(t *testing.T) {
 			expectProfileSuccess: true,
 		},
 		{
-			name:                 "Both capabilities disabled",
-			caps:                 Capabilities{CloudProvider: false, ProfileProvider: false},
+			name:                   "Only DeviceLifecycleProvider enabled",
+			caps:                   Capabilities{DeviceLifecycleProvider: true},
+			expectCloudSuccess:     false,
+			expectProfileSuccess:   false,
+			expectLifecycleSuccess: true,
+		},
+		{
+			name:                 "All capabilities disabled",
+			caps:                 Capabilities{},
 			expectCloudSuccess:   false,
 			expectProfileSuccess: false,
 		},
@@ -83,6 +95,10 @@ func TestWebhookCapabilitiesAndPost(t *testing.T) {
 					w.Write([]byte(`{}`))
 					return
 				}
+				if r.URL.Path == PathPostAttachDevice || r.URL.Path == PathPreDetachDevice {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
 				w.WriteHeader(http.StatusNotFound)
 			}))
 			defer srv.Close()
@@ -102,6 +118,9 @@ func TestWebhookCapabilitiesAndPost(t *testing.T) {
 			if provider.caps.ProfileProvider != tt.caps.ProfileProvider {
 				t.Errorf("Expected ProfileProvider capability to be %v", tt.caps.ProfileProvider)
 			}
+			if provider.HasDeviceLifecycleProvider() != tt.caps.DeviceLifecycleProvider {
+				t.Errorf("Expected DeviceLifecycleProvider capability to be %v", tt.caps.DeviceLifecycleProvider)
+			}
 
 			attrs := provider.GetDeviceAttributes(id)
 			if tt.expectCloudSuccess && attrs == nil {
@@ -116,7 +135,124 @@ func TestWebhookCapabilitiesAndPost(t *testing.T) {
 			} else if !tt.expectProfileSuccess && err == nil {
 				t.Errorf("Expected GetProfileConfig to fail due to lack of capability")
 			}
+
+			err = provider.PostAttachDevice(ctx, cloudprovider.DeviceLifecycleRequest{})
+			if tt.expectLifecycleSuccess && err != nil {
+				t.Errorf("Expected PostAttachDevice to succeed, got error: %v", err)
+			} else if !tt.expectLifecycleSuccess && err == nil {
+				t.Errorf("Expected PostAttachDevice to fail due to lack of capability")
+			}
+
+			err = provider.PreDetachDevice(ctx, cloudprovider.DeviceLifecycleRequest{})
+			if tt.expectLifecycleSuccess && err != nil {
+				t.Errorf("Expected PreDetachDevice to succeed, got error: %v", err)
+			} else if !tt.expectLifecycleSuccess && err == nil {
+				t.Errorf("Expected PreDetachDevice to fail due to lack of capability")
+			}
 		})
+	}
+}
+
+func TestWebhookDeviceLifecycleRequests(t *testing.T) {
+	ctx := context.Background()
+	received := make(chan struct {
+		path    string
+		request cloudprovider.DeviceLifecycleRequest
+	}, 2)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == PathHealth {
+			json.NewEncoder(w).Encode(Capabilities{DeviceLifecycleProvider: true})
+			return
+		}
+
+		var request cloudprovider.DeviceLifecycleRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		received <- struct {
+			path    string
+			request cloudprovider.DeviceLifecycleRequest
+		}{path: r.URL.Path, request: request}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	provider, err := NewWebhookProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("NewWebhookProvider failed: %v", err)
+	}
+
+	request := cloudprovider.DeviceLifecycleRequest{
+		Device: cloudprovider.DeviceIdentifiers{
+			Name:       "rdma0",
+			MAC:        "00:11:22:33:44:55",
+			PCIAddress: "0000:0c:00.0",
+		},
+		Claim: cloudprovider.ObjectReference{
+			Namespace: "default",
+			Name:      "rdma-claim",
+			UID:       types.UID("claim-uid"),
+		},
+		Pod: cloudprovider.ObjectReference{
+			Namespace: "default",
+			Name:      "worker-0",
+			UID:       types.UID("pod-uid"),
+		},
+		NodeName:          "worker-node-1",
+		NetworkNamespace:  "/var/run/netns/test",
+		HostInterfaceName: "rdma0",
+		PodInterfaceName:  "eth0",
+		RDMADeviceName:    "mlx5_0",
+		Config: &apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+		},
+	}
+
+	if err := provider.PostAttachDevice(ctx, request); err != nil {
+		t.Fatalf("PostAttachDevice failed: %v", err)
+	}
+	if err := provider.PreDetachDevice(ctx, request); err != nil {
+		t.Fatalf("PreDetachDevice failed: %v", err)
+	}
+
+	for _, expectedPath := range []string{PathPostAttachDevice, PathPreDetachDevice} {
+		got := <-received
+		if got.path != expectedPath {
+			t.Errorf("request path = %q, want %q", got.path, expectedPath)
+		}
+		if !reflect.DeepEqual(got.request, request) {
+			t.Errorf("request = %#v, want %#v", got.request, request)
+		}
+	}
+}
+
+func TestWebhookDeviceLifecycleContextCancellation(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == PathHealth {
+			json.NewEncoder(w).Encode(Capabilities{DeviceLifecycleProvider: true})
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+
+	provider, err := NewWebhookProvider(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("NewWebhookProvider failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err = provider.PostAttachDevice(ctx, cloudprovider.DeviceLifecycleRequest{})
+	close(release)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PostAttachDevice error = %v, want context deadline exceeded", err)
 	}
 }
 
@@ -140,7 +276,7 @@ func TestWebhookUnixSocket(t *testing.T) {
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == PathHealth {
-				caps := Capabilities{CloudProvider: true, ProfileProvider: true}
+				caps := Capabilities{CloudProvider: true, ProfileProvider: true, DeviceLifecycleProvider: true}
 				json.NewEncoder(w).Encode(caps)
 				return
 			}
@@ -167,6 +303,9 @@ func TestWebhookUnixSocket(t *testing.T) {
 
 	if !provider.caps.CloudProvider || !provider.caps.ProfileProvider {
 		t.Errorf("Failed to retrieve capabilities over unix socket")
+	}
+	if err := provider.PostAttachDevice(ctx, cloudprovider.DeviceLifecycleRequest{}); err != nil {
+		t.Errorf("PostAttachDevice failed over unix socket: %v", err)
 	}
 }
 

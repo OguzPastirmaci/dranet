@@ -17,6 +17,8 @@ limitations under the License.
 package cloudprovider
 
 import (
+	"context"
+
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -52,4 +54,33 @@ type ProfileProvider interface {
 	// ReleaseProfileConfig frees any stateful resources (like IP leases) that were
 	// previously allocated for the given claim and profile.
 	ReleaseProfileConfig(id DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error
+}
+
+// ObjectReference identifies a namespaced Kubernetes object.
+type ObjectReference struct {
+	Namespace string    `json:"namespace"`
+	Name      string    `json:"name"`
+	UID       types.UID `json:"uid"`
+}
+
+// DeviceLifecycleRequest describes a device attached to a Pod network namespace.
+type DeviceLifecycleRequest struct {
+	Device            DeviceIdentifiers   `json:"device"`
+	Claim             ObjectReference     `json:"claim"`
+	Pod               ObjectReference     `json:"pod"`
+	NodeName          string              `json:"node_name"`
+	NetworkNamespace  string              `json:"network_namespace"`
+	HostInterfaceName string              `json:"host_interface_name,omitempty"`
+	PodInterfaceName  string              `json:"pod_interface_name,omitempty"`
+	RDMADeviceName    string              `json:"rdma_device_name,omitempty"`
+	Config            *apis.NetworkConfig `json:"config,omitempty"`
+}
+
+// DeviceLifecycleProvider receives node-local device attachment notifications.
+type DeviceLifecycleProvider interface {
+	// PostAttachDevice runs after DRANET attaches and configures the device.
+	PostAttachDevice(ctx context.Context, req DeviceLifecycleRequest) error
+
+	// PreDetachDevice runs before DRANET returns the device to the host.
+	PreDetachDevice(ctx context.Context, req DeviceLifecycleRequest) error
 }

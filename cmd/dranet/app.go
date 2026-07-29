@@ -55,19 +55,22 @@ const (
 )
 
 var (
-	hostnameOverride  string
-	kubeconfig        string
-	bindAddress       string
-	celExpression     string
-	dbPath            string
-	minPollInterval   time.Duration
-	maxPollInterval   time.Duration
-	pollBurst         int
-	moveIBInterfaces  bool
-	cloudProviderHint string
-	profileProvider   string
-	webhookURL        string
-	featureGates      string
+	hostnameOverride          string
+	kubeconfig                string
+	bindAddress               string
+	celExpression             string
+	dbPath                    string
+	minPollInterval           time.Duration
+	maxPollInterval           time.Duration
+	pollBurst                 int
+	moveIBInterfaces          bool
+	cloudProviderHint         string
+	profileProvider           string
+	webhookURL                string
+	deviceLifecycleProvider   string
+	deviceLifecycleWebhookURL string
+	deviceLifecycleTimeout    time.Duration
+	featureGates              string
 
 	kubeletRootDir string
 
@@ -87,6 +90,9 @@ func init() {
 	flag.StringVar(&cloudProviderHint, "cloud-provider-hint", "", "Hint for the cloud provider that will be used to select the appropriate provider plugin. Supported values: (AWS, GCE, AZURE, OKE, ALIBABA, webhook, NONE). If left unset, the cloud provider is auto-detected.")
 	flag.StringVar(&profileProvider, "profile-provider", "cloud", "Provides user intent (cloud, webhook, none). 'cloud' falls back to the cloud-provider's native implementation.")
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
+	flag.StringVar(&deviceLifecycleProvider, "device-lifecycle-provider", "none", "Provides node-local device lifecycle hooks (webhook, none).")
+	flag.StringVar(&deviceLifecycleWebhookURL, "device-lifecycle-webhook-url", "", "URL for the device lifecycle webhook provider.")
+	flag.DurationVar(&deviceLifecycleTimeout, "device-lifecycle-timeout", time.Second, "Timeout for each device lifecycle webhook batch.")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 
@@ -192,9 +198,22 @@ func main() {
 		}
 		opts = append(opts, driver.WithFilter(prg))
 	}
-	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL)
+	cloudInst, profProv, lifecycleProv, err := setupProviders(
+		ctx,
+		cloudProviderHint,
+		profileProvider,
+		webhookURL,
+		deviceLifecycleProvider,
+		deviceLifecycleWebhookURL,
+	)
 	if err != nil {
 		klog.Fatalf("failed to setup providers: %v", err)
+	}
+	if lifecycleProv != nil {
+		if deviceLifecycleTimeout <= 0 {
+			klog.Fatalf("--device-lifecycle-timeout must be greater than zero")
+		}
+		opts = append(opts, driver.WithDeviceLifecycleProvider(lifecycleProv, deviceLifecycleTimeout))
 	}
 
 	optsDb := []inventory.Option{
@@ -246,9 +265,17 @@ func printVersion() {
 	klog.Infof("dranet go %s build: %s time: %s", info.GoVersion, vcsRevision, vcsTime)
 }
 
-func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
+func setupProviders(
+	ctx context.Context,
+	cloudProviderHint string,
+	profileProvider string,
+	webhookURL string,
+	deviceLifecycleProvider string,
+	deviceLifecycleWebhookURL string,
+) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, cloudprovider.DeviceLifecycleProvider, error) {
 	var cloudInst cloudprovider.CloudInstance
 	var profProv cloudprovider.ProfileProvider
+	var lifecycleProv cloudprovider.DeviceLifecycleProvider
 	var err error
 
 	var hint discovery.CloudProviderHint
@@ -276,7 +303,7 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 		}
 	case "webhook":
 		if webhookURL == "" {
-			return nil, nil, fmt.Errorf("--webhook-url is required when using the webhook profile provider")
+			return nil, nil, nil, fmt.Errorf("--webhook-url is required when using the webhook profile provider")
 		}
 		var wh *webhook.WebhookProvider
 		if existing, ok := cloudInst.(*webhook.WebhookProvider); ok {
@@ -284,19 +311,38 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 		} else {
 			wh, err = webhook.NewWebhookProvider(ctx, webhookURL)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to initialize webhook profile provider: %v", err)
+				return nil, nil, nil, fmt.Errorf("failed to initialize webhook profile provider: %v", err)
 			}
 		}
 
 		if !wh.HasProfileProvider() {
-			return nil, nil, fmt.Errorf("webhook at %q does not support ProfileProvider capability", webhookURL)
+			return nil, nil, nil, fmt.Errorf("webhook at %q does not support ProfileProvider capability", webhookURL)
 		}
 		profProv = wh
 	case "none":
 		profProv = nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported profile provider: %s", profileProvider)
+		return nil, nil, nil, fmt.Errorf("unsupported profile provider: %s", profileProvider)
 	}
 
-	return cloudInst, profProv, nil
+	switch deviceLifecycleProvider {
+	case "webhook":
+		if deviceLifecycleWebhookURL == "" {
+			return nil, nil, nil, fmt.Errorf("--device-lifecycle-webhook-url is required when using the webhook device lifecycle provider")
+		}
+		wh, err := webhook.NewWebhookProvider(ctx, deviceLifecycleWebhookURL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to initialize webhook device lifecycle provider: %v", err)
+		}
+		if !wh.HasDeviceLifecycleProvider() {
+			return nil, nil, nil, fmt.Errorf("webhook at %q does not support DeviceLifecycleProvider capability", deviceLifecycleWebhookURL)
+		}
+		lifecycleProv = wh
+	case "none", "":
+		lifecycleProv = nil
+	default:
+		return nil, nil, nil, fmt.Errorf("unsupported device lifecycle provider: %s", deviceLifecycleProvider)
+	}
+
+	return cloudInst, profProv, lifecycleProv, nil
 }

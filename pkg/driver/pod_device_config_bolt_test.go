@@ -55,7 +55,9 @@ func TestBoltCheckpointer_StoreAndGetOrCreate(t *testing.T) {
 	podUID := types.UID("test-pod-uid-1")
 	deviceName := "eth0"
 	config := DeviceConfig{
-		Claim: types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		Claim:           types.NamespacedName{Namespace: "ns", Name: "claim1"},
+		ClaimUID:        types.UID("claim-uid"),
+		RuntimeAttached: true,
 		NetworkInterfaceConfigInPod: apis.NetworkConfig{
 			Interface: apis.InterfaceConfig{Name: "eth0-pod"},
 			Routes: []apis.RouteConfig{
@@ -153,7 +155,9 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "persist.db")
 
 	config := DeviceConfig{
-		Claim: types.NamespacedName{Namespace: "ns1", Name: "claim1"},
+		Claim:           types.NamespacedName{Namespace: "ns1", Name: "claim1"},
+		ClaimUID:        types.UID("claim-uid"),
+		RuntimeAttached: true,
 		NetworkInterfaceConfigInPod: apis.NetworkConfig{
 			Interface: apis.InterfaceConfig{Name: "eth0-pod"},
 			Routes:    []apis.RouteConfig{{Destination: "10.0.0.0/8", Gateway: "10.0.0.1"}},
@@ -391,4 +395,3 @@ func TestPodConfigStore_NoCheckpointer(t *testing.T) {
 		t.Errorf("Close() error: %v", err)
 	}
 }
-

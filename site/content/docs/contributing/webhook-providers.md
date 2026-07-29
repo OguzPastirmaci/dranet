@@ -5,51 +5,72 @@ weight: 5
 
 ## Bring Your Own DRANET Provider (BYODP)
 
-DRANET supports a flexible webhook architecture that allows users to supply custom implementations for both hardware discovery (Cloud Provider) and user intent (Profile Provider).
+DRANET supports custom webhook implementations for hardware discovery (Cloud Provider), user intent (Profile Provider), and node-local device lifecycle handling (Device Lifecycle Provider).
 
-Instead of hardcoding bare-metal or CNI logic directly into DRANET, you can delegate these responsibilities to an external HTTP REST server. 
+Instead of hardcoding bare-metal or CNI logic directly into DRANET, you can delegate these responsibilities to an external server over HTTP, HTTPS, or a Unix domain socket.
 
 ### Enabling Webhook Providers
 
 To enable the webhook provider, update the `dranet` daemonset arguments:
 
-* **`--cloud-provider-hint=webhook`**: Instructs DRANET to delegate physical/infrastructural truth (e.g., base MTU, hardware MAC, VPC Subnet IP) to the webhook.
-* **`--profile-provider=webhook`**: Instructs DRANET to delegate logical network assignments and IPAM (e.g., specific IP addresses or overlays) to the webhook.
-* **`--webhook-url=<url>`**: The HTTP URL of your webhook server. It supports standard HTTP/HTTPS URLs (e.g., `http://127.0.0.1:8080`) as well as Unix domain sockets (e.g., `unix:///var/run/dranet/webhook.sock`).
+* **`--cloud-provider-hint=webhook`**: Delegates physical infrastructure data, such as MTU, MAC address, and VPC subnet data, to the webhook.
+* **`--profile-provider=webhook`**: Delegates logical network assignments and IPAM to the webhook.
+* **`--webhook-url=<url>`**: Sets the HTTP, HTTPS, or Unix socket URL used by cloud and profile webhook providers.
+* **`--device-lifecycle-provider=webhook`**: Enables node-local post-attach and pre-detach callbacks.
+* **`--device-lifecycle-webhook-url=<url>`**: Sets the independent HTTP, HTTPS, or Unix socket URL used by the device lifecycle webhook.
+* **`--device-lifecycle-timeout=<duration>`**: Sets one timeout for each concurrent lifecycle callback batch. The default is `1s`.
 
-You can mix and match providers. For example, you can use the native GCP cloud provider for hardware discovery, but use a webhook for custom IPAM.
+The providers can be selected independently. For example, this configuration keeps native OKE hardware discovery, uses a profile webhook for IPAM, and uses a separate Unix socket provider for device lifecycle work:
+
+```text
+--cloud-provider-hint=OKE
+--profile-provider=webhook
+--webhook-url=http://127.0.0.1:18081
+--device-lifecycle-provider=webhook
+--device-lifecycle-webhook-url=unix:///var/run/dranet-lifecycle/provider.sock
+--device-lifecycle-timeout=1s
+```
+
+The lifecycle URL is separate by design. It may point to the same server as `--webhook-url`, but it does not need to.
 
 ### Architecture Pipeline
 
-The following diagram illustrates how DRANET communicates with the webhook providers during device discovery and profile resolution:
+The following diagram illustrates how DRANET communicates with the providers during discovery, profile resolution, and device attachment:
 
 ```mermaid
 sequenceDiagram
     participant D as DRANET Daemon
-    participant W as Webhook Server (BYODP)
-    
-    note over D,W: Initialization Phase
-    D->>W: GET /health
-    W-->>D: { "cloudProvider": true, "profileProvider": true }
-    
-    note over D,W: Cloud Provider Phase (Hardware Discovery)
-    D->>W: POST /GetDeviceAttributes (Device ID)
-    W-->>D: Hardware attributes (MAC, PCI, Network constraints)
-    D->>W: POST /GetDeviceConfig (Device ID)
-    W-->>D: Baseline Hardware Settings (MTU, baseline routes)
-    
-    note over D,W: Profile Provider Phase (User Intent Resolution)
-    D->>W: POST /GetProfileConfig (Device ID, full NetworkConfig containing Profile Name)
-    W-->>D: Logical Network Config (Assigned IPs, custom routes)
-    
-    note over D: DRANET merges all configs
-    note over D: DRANET programs the interface statically
-    
-    note over D,W: Teardown Phase
-    D->>W: POST /ReleaseProfileConfig (Device ID, full NetworkConfig)
-    W-->>D: 200 OK (Resources released)
-```
+    participant C as Cloud or Profile Webhook
+    participant L as Device Lifecycle Webhook
 
+    note over D,L: Initialization
+    D->>C: GET /health
+    C-->>D: Cloud and profile capabilities
+    D->>L: GET /health
+    L-->>D: Device lifecycle capability
+
+    note over D,C: Hardware discovery
+    D->>C: POST /GetDeviceAttributes
+    C-->>D: Hardware attributes
+    D->>C: POST /GetDeviceConfig
+    C-->>D: Baseline network settings
+
+    note over D,C: Profile resolution
+    D->>C: POST /GetProfileConfig
+    C-->>D: Resolved profile configuration
+
+    note over D: DRANET merges all configs
+    note over D: DRANET attaches and configures the device
+    D->>L: POST /PostAttachDevice
+    L-->>D: 200 OK
+
+    note over D,L: Teardown
+    D->>L: POST /PreDetachDevice
+    L-->>D: 200 OK
+    note over D: DRANET returns the device to the host
+    D->>C: POST /ReleaseProfileConfig
+    C-->>D: 200 OK
+```
 
 ### How it Works in Practice
 
@@ -59,8 +80,11 @@ Profile providers are options that third-party providers can expose to users to 
 **2. Cloud Providers (Cluster Provider Intent)**
 Cloud providers are the authoritative source for the VM and its hardware, which is usually exposed via instance metadata. We offer two hooks for cloud providers: one to enhance the existing hardware metadata during discovery, and another to automate the provisioning of baseline hardware configurations. This represents the "cluster provider intent."
 
-**3. Solid and Predictable Runtime Abstraction**
-Regardless of which providers are in use, we always keep the same abstraction on the runtime for DRANET: a network interface and its associated network parameters (like IPs, routes, and rules). All of these external hooks work together to merge into a final, statically verifiable configuration for these interfaces *before* execution. This makes the DRANET runtime solid and predictable, in contrast with the dynamic behavior of standard CNI plugins that stop the world during runtime.
+**3. Device Lifecycle Providers (Node Runtime Intent)**
+Device lifecycle providers handle node-local work that can only happen after a device enters the Pod network namespace or immediately before it returns to the host. Examples include starting an authentication process or notifying a local device agent. These callbacks are bounded by a short timeout because they run in time-sensitive NRI hooks.
+
+**4. Solid and Predictable Runtime Abstraction**
+Cloud and profile providers still merge into a final, statically verifiable network configuration before runtime execution. The lifecycle provider is a narrow runtime extension. It receives the final pod-side configuration and device location, but it does not replace DRANET's interface programming.
 
 ### Webhook Capabilities Validation
 
@@ -71,11 +95,12 @@ When DRANET connects to the webhook, it performs an HTTP `GET /health` and expec
 ```json
 {
   "cloudProvider": false,
-  "profileProvider": true
+  "profileProvider": true,
+  "deviceLifecycleProvider": false
 }
 ```
 
-If you start DRANET with `--cloud-provider-hint=webhook` but the webhook returns `"cloudProvider": false`, DRANET will log a fatal error during initialization to prevent misconfiguration.
+If a selected provider reports that its capability is false, DRANET exits during initialization to prevent misconfiguration. For example, `--device-lifecycle-provider=webhook` requires `"deviceLifecycleProvider": true`.
 
 ### API Contracts
 
@@ -88,7 +113,7 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
 
 #### Profile Provider API (`profileProvider: true`)
 
-* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM). 
+* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM).
 
   **Mutation & Validation**: The webhook receives the *entire* `NetworkConfig` (combined from user and cloud intents) as context. Unlike standard Mutating Webhooks on the API server, this node-level webhook cannot directly mutate the opaque config object in the API server. Instead, it computes and returns the *resolved profile parameters* (like the chosen IP), which DRANET then merges into the final configuration. Passing the full configuration gives the webhook the power of a Validating Admission Controller.
 
@@ -110,6 +135,97 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
 
 * `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). Also receives the full `NetworkConfig`. Should return `200 OK` on success or if the resource was already released (idempotency).
   * **Best-effort teardown**: A failed `ReleaseProfileConfig` is logged but not retried by DRANET (teardown must not block pod deletion). The provider therefore owns leak reclamation and must be able to garbage-collect orphaned allocations on its own, otherwise resources leak permanently.
+
+#### Device Lifecycle API (`deviceLifecycleProvider: true`)
+
+The device lifecycle provider is node-local because network namespace paths are valid only on the node where the Pod runs. Both endpoints receive the same JSON request:
+
+```json
+{
+  "device": {
+    "name": "rdma0",
+    "mac_address": "00:11:22:33:44:55",
+    "pci_address": "0000:0c:00.0"
+  },
+  "claim": {
+    "namespace": "default",
+    "name": "rdma-claim",
+    "uid": "1df9fd4b-53c7-4cab-b6d4-bf0be5ee6526"
+  },
+  "pod": {
+    "namespace": "default",
+    "name": "worker-0",
+    "uid": "fed8b82e-f193-4a52-83c2-b8b021763dc6"
+  },
+  "node_name": "worker-node-1",
+  "network_namespace": "/var/run/netns/cni-1234",
+  "host_interface_name": "rdma0",
+  "pod_interface_name": "net1",
+  "rdma_device_name": "mlx5_0",
+  "config": {
+    "interface": {
+      "name": "net1",
+      "addresses": [
+        "192.0.2.10/24"
+      ],
+      "mtu": 9000
+    }
+  }
+}
+```
+
+The fields have these meanings:
+
+* `device` contains the locally discovered device identifiers.
+* `claim` and `pod` contain stable Kubernetes object identity.
+* `node_name` identifies the node that owns the namespace and device.
+* `network_namespace` is the runtime-provided network namespace path. It can be empty or stale during teardown when the runtime has already removed the namespace.
+* `host_interface_name` is the interface name before attachment.
+* `pod_interface_name` is the final interface name inside the Pod namespace.
+* `rdma_device_name` is the associated RDMA link device, if present.
+* `config` is the final pod-side `NetworkConfig` after user, cloud, and profile configurations have been merged.
+
+The interface name fields and `rdma_device_name` are optional. IB-only devices have no netdev, so their interface name fields are omitted. Lifecycle callbacks apply to them when `rdma_device_name` is present and DRANET uses exclusive RDMA namespace mode.
+
+* `POST /PostAttachDevice`: Runs after DRANET attaches and configures the netdev and RDMA device. A timeout or non-200 response fails `RunPodSandbox`. A `200 OK` response confirms that the provider accepted the device. It does not mean that a longer operation, such as link authorization, has completed.
+* `POST /PreDetachDevice`: Runs before DRANET attempts to return the RDMA device and netdev to the host. The runtime may already have removed the network namespace, so providers must also support cleanup by stable pod, claim, and device identity. Failures are logged, but teardown continues.
+
+Both endpoints must be idempotent. NRI may repeat callbacks for the same Pod and device. DRANET also replays callbacks in these cases:
+
+* `Synchronize` replays `PostAttachDevice` for live devices restored from DRANET state.
+* `RemovePodSandbox` replays `PreDetachDevice` as a fallback when normal stop handling did not complete.
+
+The provider must still reconcile its own state. Node crashes, forced process termination, and other failures can prevent a callback.
+
+DRANET sends callbacks for all devices in a hook concurrently under one timeout. Increasing the timeout delays the time-sensitive NRI hook for the whole Pod.
+
+Kernel device moves and persistent state updates are not atomic. A crash in the short interval between them can cause a missed replay or an extra idempotent replay. The provider must use stable request identities and reconcile its desired state.
+
+##### Persistent replay state
+
+Replay across DRANET DaemonSet Pod replacement requires a persistent DRANET database. The binary defaults to `/var/run/dranet/dranet.db`, but the chart does not host-mount that directory by default. Use `extraVolumeMounts` and `extraVolumes` to place it on the node:
+
+```yaml
+extraVolumeMounts:
+  - name: dranet-state
+    mountPath: /var/run/dranet
+
+extraVolumes:
+  - name: dranet-state
+    hostPath:
+      path: /var/lib/dranet
+      type: DirectoryOrCreate
+```
+
+Without this mount, stored device state is ephemeral and lifecycle replay after a DRANET container or Pod replacement is not available.
+
+##### Node-local deployment
+
+For a Unix socket, mount the socket's parent directory into both DRANET and the provider. Mounting the directory avoids requiring the socket file to exist before either DaemonSet starts.
+
+For HTTP, run the provider on every node with `hostNetwork: true` and use a loopback URL such as `http://127.0.0.1:18080`. Do not use a normal Kubernetes Service that may send the request to another node.
+
+If the provider enters `network_namespace`, it must resolve the path in its own mount and PID namespace. Mount the same `/var/run/netns` host directory when the runtime uses that path, or provide equivalent host namespace access.
 
 ### Reference Implementation
 

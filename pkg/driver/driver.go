@@ -24,8 +24,9 @@ import (
 	"time"
 
 	"github.com/google/cel-go/cel"
-	"sigs.k8s.io/dranet/pkg/apis"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/dranet/pkg/apis"
+	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/inventory"
 
 	"github.com/containerd/nri/pkg/stub"
@@ -103,6 +104,14 @@ func WithKubeletRootDir(dir string) Option {
 	}
 }
 
+// WithDeviceLifecycleProvider sets the provider used for runtime device hooks.
+func WithDeviceLifecycleProvider(provider cloudprovider.DeviceLifecycleProvider, timeout time.Duration) Option {
+	return func(o *NetworkDriver) {
+		o.deviceLifecycleProvider = provider
+		o.deviceLifecycleTimeout = timeout
+	}
+}
+
 type NetworkDriver struct {
 	draPlugin     pluginHelper
 	driverName    string
@@ -116,9 +125,11 @@ type NetworkDriver struct {
 	celProgram cel.Program
 
 	// Cache the rdma shared mode state
-	rdmaSharedMode bool
-	podConfigStore *PodConfigStore
-	dbPath         string // path for persistent bbolt database; empty means in-memory
+	rdmaSharedMode          bool
+	podConfigStore          *PodConfigStore
+	dbPath                  string // path for persistent bbolt database; empty means in-memory
+	deviceLifecycleProvider cloudprovider.DeviceLifecycleProvider
+	deviceLifecycleTimeout  time.Duration
 
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.
