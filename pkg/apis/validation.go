@@ -259,6 +259,10 @@ func validateRoutes(routes []RouteConfig, fieldPath string) (allErrors []error) 
 		if route.Table < 0 {
 			allErrors = append(allErrors, fmt.Errorf("%s.table: must be a non-negative integer, got %d", currentFieldPath, route.Table))
 		}
+
+		if route.Metric < 0 {
+			allErrors = append(allErrors, fmt.Errorf("%s.metric: must be a non-negative integer, got %d", currentFieldPath, route.Metric))
+		}
 	}
 	return allErrors
 }
@@ -276,12 +280,20 @@ func validateRules(rules []RuleConfig, fieldPath string) (allErrors []error) {
 			allErrors = append(allErrors, fmt.Errorf("%s.table: must be a non-negative integer, got %d", currentFieldPath, rule.Table))
 		}
 
+		if rule.Family != 0 && rule.Family != unix.AF_INET && rule.Family != unix.AF_INET6 {
+			allErrors = append(allErrors, fmt.Errorf("%s.family: must be 0, AF_INET (%d), or AF_INET6 (%d), got %d", currentFieldPath, unix.AF_INET, unix.AF_INET6, rule.Family))
+		}
+
 		var srcIP, dstIP net.IP
 		if rule.Source != "" {
 			if ip, _, err := net.ParseCIDR(rule.Source); err != nil {
 				allErrors = append(allErrors, fmt.Errorf("%s.source: invalid CIDR format '%s'", currentFieldPath, rule.Source))
 			} else {
 				srcIP = ip
+				if (rule.Family == unix.AF_INET && ip.To4() == nil) ||
+					(rule.Family == unix.AF_INET6 && ip.To4() != nil) {
+					allErrors = append(allErrors, fmt.Errorf("%s.source: '%s' does not match rule family %d", currentFieldPath, rule.Source, rule.Family))
+				}
 			}
 		}
 
@@ -290,6 +302,10 @@ func validateRules(rules []RuleConfig, fieldPath string) (allErrors []error) {
 				allErrors = append(allErrors, fmt.Errorf("%s.destination: invalid CIDR format '%s'", currentFieldPath, rule.Destination))
 			} else {
 				dstIP = ip
+				if (rule.Family == unix.AF_INET && ip.To4() == nil) ||
+					(rule.Family == unix.AF_INET6 && ip.To4() != nil) {
+					allErrors = append(allErrors, fmt.Errorf("%s.destination: '%s' does not match rule family %d", currentFieldPath, rule.Destination, rule.Family))
+				}
 			}
 		}
 

@@ -358,8 +358,21 @@ func TestValidateRoutes(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "valid route with metric",
+			routes:    []RouteConfig{{Destination: "10.10.10.0/24", Gateway: "192.168.1.1", Metric: 100}},
+			fieldPath: "routes",
+			expectErr: false,
+		},
+		{
 			name:      "invalid route with negative table",
 			routes:    []RouteConfig{{Destination: "10.10.10.0/24", Gateway: "192.168.1.1", Table: -1}},
+			fieldPath: "routes",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "invalid route with negative metric",
+			routes:    []RouteConfig{{Destination: "10.10.10.0/24", Gateway: "192.168.1.1", Metric: -1}},
 			fieldPath: "routes",
 			expectErr: true,
 			errCount:  1,
@@ -544,9 +557,30 @@ func TestValidateRules(t *testing.T) {
 		},
 		{
 			name:      "valid IPv6 rule with matching source and destination IP family",
-			rules:     []RuleConfig{{Source: "2001:db8::/64", Destination: "2001:db8:1::/64", Table: 100}},
+			rules:     []RuleConfig{{Family: unix.AF_INET6, Source: "2001:db8::/64", Destination: "2001:db8:1::/64", Table: 100}},
 			fieldPath: "rules",
 			expectErr: false,
+		},
+		{
+			name:      "invalid address family",
+			rules:     []RuleConfig{{Family: 123, Table: 100}},
+			fieldPath: "rules",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "source does not match address family",
+			rules:     []RuleConfig{{Family: unix.AF_INET, Source: "2001:db8::/64", Table: 100}},
+			fieldPath: "rules",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "destination does not match address family",
+			rules:     []RuleConfig{{Family: unix.AF_INET6, Destination: "10.0.0.0/8", Table: 100}},
+			fieldPath: "rules",
+			expectErr: true,
+			errCount:  1,
 		},
 		{
 			name:      "source and destination family mismatch",

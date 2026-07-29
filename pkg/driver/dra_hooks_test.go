@@ -19,8 +19,10 @@ package driver
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"encoding/json"
 	"net/http"
@@ -28,6 +30,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	resourcev1 "k8s.io/api/resource/v1"
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -249,6 +253,132 @@ func TestUnprepareResourceClaimsMetrics(t *testing.T) {
 			t.Fatalf("CollectAndCompare failed: %v", err)
 		}
 	})
+}
+
+func TestUnprepareResourceClaimRetainsConfigUntilHostInterfacesReturn(t *testing.T) {
+	claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
+	np := &NetworkDriver{
+		podConfigStore: mustNewPodConfigStore(),
+	}
+	np.podConfigStore.SetDeviceConfig("pod-uid-1", "device-a", DeviceConfig{
+		Claim: claimName,
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "dranet-missing-a"},
+		},
+	})
+	np.podConfigStore.SetDeviceConfig("pod-uid-1", "device-b", DeviceConfig{
+		Claim: claimName,
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "dranet-missing-b"},
+		},
+	})
+
+	claim := kubeletplugin.NamespacedObject{
+		NamespacedName: claimName,
+		UID:            "claim-uid-1",
+	}
+	err := np.unprepareResourceClaim(context.Background(), claim)
+	if err == nil {
+		t.Fatal("expected unprepare to fail while host interfaces are unavailable")
+	}
+	if !strings.Contains(err.Error(), "host interface dranet-missing-") {
+		t.Fatalf("unexpected unprepare error: %v", err)
+	}
+
+	podConfig, ok := np.podConfigStore.GetPodConfig("pod-uid-1")
+	if !ok {
+		t.Fatal("pod config was deleted before host interfaces returned")
+	}
+	if len(podConfig.DeviceConfigs) != 2 {
+		t.Fatalf("expected both device configs to remain, got %d", len(podConfig.DeviceConfigs))
+	}
+}
+
+func TestUnprepareResourceClaimRetriesUntilHostAddressReturns(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("test requires root privileges")
+	}
+
+	ifName := fmt.Sprintf("du%d", os.Getpid())
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: ifName}}
+	if err := netlink.LinkAdd(link); err != nil {
+		t.Fatalf("failed to create dummy interface: %v", err)
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		t.Fatalf("failed to set dummy interface up: %v", err)
+	}
+	t.Cleanup(func() {
+		if currentLink, err := netlink.LinkByName(ifName); err == nil {
+			_ = netlink.LinkDel(currentLink)
+		}
+	})
+
+	claimName := types.NamespacedName{Name: "test-claim", Namespace: "test-ns"}
+	np := &NetworkDriver{
+		podConfigStore: mustNewPodConfigStore(),
+	}
+	np.podConfigStore.SetDeviceConfig("pod-uid-1", "device-a", DeviceConfig{
+		Claim: claimName,
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: ifName},
+		},
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Addresses: []string{"192.0.2.1/32"}},
+		},
+	})
+	claim := kubeletplugin.NamespacedObject{
+		NamespacedName: claimName,
+		UID:            "claim-uid-1",
+	}
+
+	err := np.unprepareResourceClaim(context.Background(), claim)
+	if err == nil || !strings.Contains(err.Error(), "address 192.0.2.1/32 has not returned") {
+		t.Fatalf("expected missing host address error, got %v", err)
+	}
+	if _, ok := np.podConfigStore.GetPodConfig("pod-uid-1"); !ok {
+		t.Fatal("pod config was deleted before the host address returned")
+	}
+
+	address, err := netlink.ParseAddr("192.0.2.1/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.AddrAdd(link, address); err != nil {
+		t.Fatalf("failed to add host address: %v", err)
+	}
+	err = np.unprepareResourceClaim(context.Background(), claim)
+	if err == nil || !strings.Contains(err.Error(), "pending verification") {
+		t.Fatalf("expected pending verification retry, got %v", err)
+	}
+	deviceConfig, ok := np.podConfigStore.GetDeviceConfig("pod-uid-1", "device-a")
+	if !ok || deviceConfig.HostRestoreAttemptedAt == 0 {
+		t.Fatal("host restoration attempt was not persisted")
+	}
+
+	err = np.unprepareResourceClaim(context.Background(), claim)
+	if err == nil || !strings.Contains(err.Error(), "waiting for stabilization") {
+		t.Fatalf("expected stabilization retry, got %v", err)
+	}
+	deviceConfig.HostRestoreAttemptedAt = time.Now().Add(-hostRestoreStabilizationAge).UnixNano()
+	if err := np.podConfigStore.SetDeviceConfig("pod-uid-1", "device-a", deviceConfig); err != nil {
+		t.Fatalf("failed to age restoration attempt: %v", err)
+	}
+	if err := netlink.LinkSetDown(link); err != nil {
+		t.Fatalf("failed to set dummy interface down: %v", err)
+	}
+	if err := np.unprepareResourceClaim(context.Background(), claim); err != nil {
+		t.Fatalf("unprepare verification retry failed: %v", err)
+	}
+	refreshedLink, err := netlink.LinkByName(ifName)
+	if err != nil {
+		t.Fatalf("failed to refresh dummy interface: %v", err)
+	}
+	if refreshedLink.Attrs().RawFlags&unix.IFF_UP == 0 {
+		t.Fatal("dummy interface remained down after final restoration")
+	}
+	if _, ok := np.podConfigStore.GetPodConfig("pod-uid-1"); ok {
+		t.Fatal("pod config was retained after successful restoration")
+	}
 }
 
 func TestClaimPrepareFailedEvent(t *testing.T) {
@@ -904,7 +1034,7 @@ func TestMergeDevices(t *testing.T) {
 			expected: []resourcev1.Device{pciDevSnapshot},
 		},
 		{
-			name:      "Live device attribute takes precedence over snapshot",
+			name: "Live device attribute takes precedence over snapshot",
 			live: []resourcev1.Device{{
 				Name: "0000:c0:14.0",
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
@@ -926,7 +1056,7 @@ func TestMergeDevices(t *testing.T) {
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"network-bandwidth": qtyCap("1G"),
-					"other-capacity":     qtyCap("50"),
+					"other-capacity":    qtyCap("50"),
 				},
 			}},
 			expected: []resourcev1.Device{{
@@ -939,7 +1069,7 @@ func TestMergeDevices(t *testing.T) {
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"network-bandwidth": qtyCap("10G"),
-					"other-capacity":     qtyCap("50"),
+					"other-capacity":    qtyCap("50"),
 				},
 			}},
 		},

@@ -62,6 +62,14 @@ type DeviceConfig struct {
 	// Pod's namespace.
 	NetworkInterfaceConfigInPod apis.NetworkConfig `json:"networkInterfaceConfigInPod"`
 
+	// HostInterfaceIPv4Sysctls contains per-interface IPv4 sysctl values
+	// captured before the interface moves out of the host namespace.
+	HostInterfaceIPv4Sysctls *InterfaceIPv4Sysctls `json:"hostInterfaceIPv4Sysctls,omitempty"`
+
+	// HostRestoreAttemptedAt keeps the checkpoint through a stabilization
+	// window after the interface first returns to the host.
+	HostRestoreAttemptedAt int64 `json:"hostRestoreAttemptedAt,omitempty"`
+
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`

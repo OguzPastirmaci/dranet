@@ -46,7 +46,8 @@ import (
 )
 
 const (
-	rdmaCmPath = "/dev/infiniband/rdma_cm"
+	rdmaCmPath                  = "/dev/infiniband/rdma_cm"
+	hostRestoreStabilizationAge = 30 * time.Second
 )
 
 // DRA hooks exposes Network Devices to Kubernetes, the Network devices and its attributes are
@@ -309,6 +310,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 		deviceCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
 
+		hostIPv4Sysctls, err := readInterfaceIPv4Sysctls(ifName)
+		if err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to capture IPv4 sysctls for interface %s: %w", ifName, err))
+			continue
+		}
+		deviceCfg.HostInterfaceIPv4Sysctls = hostIPv4Sysctls
+
 		if deviceCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
 			// If the interface name was not explicitly overridden, use the same
 			// interface name within the pod's network namespace.
@@ -404,18 +412,29 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			errorList = append(errorList, err)
 			continue
 		}
-		deviceCfg.NetworkInterfaceConfigInPod.Routes = append(deviceCfg.NetworkInterfaceConfigInPod.Routes, routes...)
+		deviceCfg.NetworkInterfaceConfigInHost.Routes = append(deviceCfg.NetworkInterfaceConfigInHost.Routes, routes...)
+		deviceCfg.NetworkInterfaceConfigInPod.Routes = appendDiscoveredRoutes(
+			deviceCfg.NetworkInterfaceConfigInPod.Routes,
+			routes,
+		)
 
-		// If VRF is enabled, we do not need to copy the rules from the host
-		// because the VRF handles the routing table lookup.
-		if deviceCfg.NetworkInterfaceConfigInPod.Interface.VRF == nil {
-			for _, table := range tables.UnsortedList() {
-				if rules, ok := rulesByTable[table]; ok {
+		for _, table := range tables.UnsortedList() {
+			if rules, ok := rulesByTable[table]; ok {
+				deviceCfg.NetworkInterfaceConfigInHost.Rules = append(deviceCfg.NetworkInterfaceConfigInHost.Rules, rules...)
+
+				// If VRF is enabled, the pod does not need the host rules
+				// because the VRF handles the routing table lookup.
+				if deviceCfg.NetworkInterfaceConfigInPod.Interface.VRF == nil {
 					klog.V(5).Infof("Adding %d rules for table %d associated with interface %s", len(rules), table, ifName)
-					deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, rules...)
-					// Avoid adding the same rule twice
-					delete(rulesByTable, table)
+					podRules := translateRuleInterfaceNames(
+						rules,
+						ifName,
+						deviceCfg.NetworkInterfaceConfigInPod.Interface.Name,
+					)
+					deviceCfg.NetworkInterfaceConfigInPod.Rules = append(deviceCfg.NetworkInterfaceConfigInPod.Rules, podRules...)
 				}
+				// Avoid adding the same rule twice.
+				delete(rulesByTable, table)
 			}
 		}
 
@@ -517,6 +536,13 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 }
 
 func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+	type claimDevice struct {
+		podUID types.UID
+		name   string
+		config DeviceConfig
+	}
+
+	var devices []claimDevice
 	for _, podUID := range np.podConfigStore.ListPods() {
 		podCfg, ok := np.podConfigStore.GetPodConfig(podUID)
 		if !ok {
@@ -524,16 +550,155 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 		}
 		for deviceName, devCfg := range podCfg.DeviceConfigs {
 			if devCfg.Claim.Namespace == claim.Namespace && devCfg.Claim.Name == claim.Name {
-				if devCfg.NetworkInterfaceConfigInPod.Profile != "" {
-					if err := np.netdb.ReleaseProfileConfig(deviceName, claim.UID, &devCfg.NetworkInterfaceConfigInPod); err != nil {
-						klog.Errorf("failed to release profile config for claim %v: %v", claim.NamespacedName, err)
-					}
-				}
+				devices = append(devices, claimDevice{
+					podUID: podUID,
+					name:   deviceName,
+					config: devCfg,
+				})
+			}
+		}
+	}
+
+	var errorList []error
+	now := time.Now()
+	for _, device := range devices {
+		if device.config.NetworkInterfaceConfigInHost.Interface.Name == "" ||
+			device.config.HostRestoreAttemptedAt == 0 {
+			continue
+		}
+		attemptedAt := time.Unix(0, device.config.HostRestoreAttemptedAt)
+		if now.Sub(attemptedAt) < hostRestoreStabilizationAge {
+			return fmt.Errorf("host interface restoration for claim %s/%s is waiting for stabilization", claim.Namespace, claim.Name)
+		}
+	}
+
+	for _, device := range devices {
+		hostIfName := device.config.NetworkInterfaceConfigInHost.Interface.Name
+		if hostIfName == "" {
+			continue
+		}
+		link, err := np.resolveHostInterfaceForRestore(device.name, device.config)
+		if err != nil {
+			errorList = append(errorList, err)
+			continue
+		}
+		if err := ensureHostInterfaceAddressesReady(
+			link,
+			device.config.NetworkInterfaceConfigInPod.Interface.Addresses,
+		); err != nil {
+			errorList = append(errorList, fmt.Errorf("host interface %s is not ready for restoration: %w", hostIfName, err))
+		}
+	}
+	if len(errorList) > 0 {
+		return errors.Join(errorList...)
+	}
+
+	needsVerificationRetry := false
+	for _, device := range devices {
+		hostIfName := device.config.NetworkInterfaceConfigInHost.Interface.Name
+		if hostIfName != "" {
+			if err := restoreHostInterfaceConfig(
+				hostIfName,
+				device.config.NetworkInterfaceConfigInHost,
+				device.config.HostInterfaceIPv4Sysctls,
+			); err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to restore host interface %s: %w", hostIfName, err))
+				continue
+			}
+			if device.config.HostRestoreAttemptedAt == 0 {
+				needsVerificationRetry = true
+			}
+		}
+	}
+	if len(errorList) > 0 {
+		return errors.Join(errorList...)
+	}
+
+	if needsVerificationRetry {
+		for _, device := range devices {
+			if device.config.NetworkInterfaceConfigInHost.Interface.Name == "" {
+				continue
+			}
+			device.config.HostRestoreAttemptedAt = time.Now().UnixNano()
+			if err := np.podConfigStore.SetDeviceConfig(device.podUID, device.name, device.config); err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to persist host restoration attempt for device %s: %w", device.name, err))
+			}
+		}
+		if len(errorList) > 0 {
+			return errors.Join(errorList...)
+		}
+		return fmt.Errorf("host interface restoration for claim %s/%s is pending verification", claim.Namespace, claim.Name)
+	}
+
+	for _, device := range devices {
+		if device.config.NetworkInterfaceConfigInPod.Profile != "" {
+			if err := np.netdb.ReleaseProfileConfig(device.name, claim.UID, &device.config.NetworkInterfaceConfigInPod); err != nil {
+				klog.Errorf("failed to release profile config for claim %v: %v", claim.NamespacedName, err)
 			}
 		}
 	}
 
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+	return nil
+}
+
+func (np *NetworkDriver) resolveHostInterfaceForRestore(deviceName string, config DeviceConfig) (netlink.Link, error) {
+	hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
+	link, err := nlwrap.LinkByName(hostIfName)
+	if err == nil {
+		return link, nil
+	}
+
+	podIfName := config.NetworkInterfaceConfigInPod.Interface.Name
+	if podIfName == "" || podIfName == hostIfName || np.netdb == nil {
+		return nil, fmt.Errorf("host interface %s is not available for restoration: %w", hostIfName, err)
+	}
+
+	currentIfName, inventoryErr := np.netdb.GetNetInterfaceName(deviceName)
+	if inventoryErr != nil {
+		return nil, fmt.Errorf("host interface %s is not available for restoration: %w", hostIfName, err)
+	}
+	link, err = nlwrap.LinkByName(currentIfName)
+	if err != nil {
+		return nil, fmt.Errorf("returned interface %s for device %s is not available: %w", currentIfName, deviceName, err)
+	}
+	if err := netlink.LinkSetDown(link); err != nil {
+		return nil, fmt.Errorf("failed to set returned interface %s down: %w", currentIfName, err)
+	}
+	if err := netlink.LinkSetName(link, hostIfName); err != nil {
+		return nil, fmt.Errorf("failed to restore interface name %s from %s: %w", hostIfName, currentIfName, err)
+	}
+	link, err = nlwrap.LinkByName(hostIfName)
+	if err != nil {
+		return nil, fmt.Errorf("restored host interface %s is not available: %w", hostIfName, err)
+	}
+	return link, nil
+}
+
+func ensureHostInterfaceAddressesReady(link netlink.Link, expected []string) error {
+	if len(expected) == 0 {
+		return nil
+	}
+
+	addresses, err := nlwrap.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("failed to list addresses: %w", err)
+	}
+	found := make(map[string]struct{}, len(addresses))
+	for _, address := range addresses {
+		if address.IPNet != nil {
+			found[address.IPNet.String()] = struct{}{}
+		}
+	}
+	for _, address := range expected {
+		expectedAddress, err := netlink.ParseAddr(address)
+		if err != nil {
+			return fmt.Errorf("invalid expected address %s: %w", address, err)
+		}
+		if _, ok := found[expectedAddress.IPNet.String()]; !ok {
+			return fmt.Errorf("address %s has not returned", address)
+		}
+	}
 	return nil
 }
 
@@ -596,23 +761,66 @@ func getRuleInfo(nlHandle nlwrap.Handle) (map[int][]apis.RuleConfig, error) {
 		return nil, fmt.Errorf("failed to get ip rules: %w", err)
 	}
 	for _, rule := range rules {
-		ruleCfg := apis.RuleConfig{
-			Priority: rule.Priority,
-			Table:    rule.Table,
-		}
-		if rule.Src != nil {
-			ruleCfg.Source = rule.Src.String()
-		}
-		if rule.Dst != nil {
-			ruleCfg.Destination = rule.Dst.String()
-		}
 		// Only care about rules with route tables associated, and exclude main and local tables.
 		if rule.Table > 0 && rule.Table != unix.RT_TABLE_MAIN && rule.Table != unix.RT_TABLE_LOCAL {
+			if !canPreserveRule(rule) {
+				klog.V(2).Infof("Skipping rule %s for table %d because it has unsupported selectors", rule.String(), rule.Table)
+				continue
+			}
+			ruleCfg := ruleToConfig(rule)
 			klog.V(5).Infof("Found rule %s for table %d", rule.String(), rule.Table)
 			rulesByTable[rule.Table] = append(rulesByTable[rule.Table], ruleCfg)
 		}
 	}
 	return rulesByTable, nil
+}
+
+func ruleToConfig(rule netlink.Rule) apis.RuleConfig {
+	ruleCfg := apis.RuleConfig{
+		Priority: rule.Priority,
+		Family:   rule.Family,
+		Protocol: rule.Protocol,
+		IifName:  rule.IifName,
+		OifName:  rule.OifName,
+		Table:    rule.Table,
+	}
+	if rule.Src != nil {
+		ruleCfg.Source = rule.Src.String()
+	}
+	if rule.Dst != nil {
+		ruleCfg.Destination = rule.Dst.String()
+	}
+	return ruleCfg
+}
+
+func canPreserveRule(rule netlink.Rule) bool {
+	return rule.Mark == 0 &&
+		rule.Mask == nil &&
+		rule.Tos == 0 &&
+		rule.TunID == 0 &&
+		rule.Goto < 0 &&
+		rule.Flow < 0 &&
+		rule.SuppressIfgroup < 0 &&
+		rule.SuppressPrefixlen < 0 &&
+		!rule.Invert &&
+		rule.Dport == nil &&
+		rule.Sport == nil &&
+		rule.IPProto == 0 &&
+		rule.UIDRange == nil
+}
+
+func translateRuleInterfaceNames(rules []apis.RuleConfig, fromName, toName string) []apis.RuleConfig {
+	translated := make([]apis.RuleConfig, len(rules))
+	copy(translated, rules)
+	for i := range translated {
+		if translated[i].IifName == fromName {
+			translated[i].IifName = toName
+		}
+		if translated[i].OifName == fromName {
+			translated[i].OifName = toName
+		}
+	}
+	return translated
 }
 
 // getRouteInfo retrieves all routes associated with a given network interface.
@@ -630,12 +838,6 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 		return nil, nil, fmt.Errorf("fail to get ip routes for interface %s : %w", ifName, err)
 	}
 	for _, route := range rl {
-		routeCfg := apis.RouteConfig{}
-		// routes need a destination
-		if route.Dst == nil {
-			klog.V(5).Infof("Skipping route %s for interface %s because it has no destination", route.String(), ifName)
-			continue
-		}
 		// Do not copy routes from the local table because they are specific
 		// to the host and the kernel will manage the local routing
 		// table within the pod's network namespace.
@@ -644,8 +846,10 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 			continue
 		}
 		// Discard IPv6 link-local routes, but allow IPv4 link-local.
-		if route.Dst.IP.To4() == nil {
-			if route.Dst.IP.IsLinkLocalUnicast() {
+		isIPv6 := route.Family == netlink.FAMILY_V6 ||
+			(route.Dst != nil && route.Dst.IP.To4() == nil)
+		if isIPv6 {
+			if route.Dst != nil && route.Dst.IP.IsLinkLocalUnicast() {
 				klog.V(5).Infof("Skipping IPv6 link-local route %s for interface %s", route.String(), ifName)
 				continue
 			}
@@ -655,15 +859,11 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 				continue
 			}
 		}
-		routeCfg.Destination = route.Dst.String()
-		if route.Gw != nil {
-			routeCfg.Gateway = route.Gw.String()
+		routeCfg, ok := routeToConfig(route)
+		if !ok {
+			klog.V(5).Infof("Skipping route %s for interface %s because its address family is unknown", route.String(), ifName)
+			continue
 		}
-		if route.Src != nil {
-			routeCfg.Source = route.Src.String()
-		}
-		routeCfg.Scope = uint8(route.Scope)
-		routeCfg.Table = route.Table
 		routes = append(routes, routeCfg)
 		// Collect table IDs for rules lookup later.
 		if route.Table > 0 {
@@ -672,6 +872,58 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 		}
 	}
 	return routes, tables, nil
+}
+
+func appendDiscoveredRoutes(configured, discovered []apis.RouteConfig) []apis.RouteConfig {
+	type routeKey struct {
+		destination string
+		table       int
+	}
+
+	result := append([]apis.RouteConfig(nil), configured...)
+	seen := make(map[routeKey]struct{}, len(configured)+len(discovered))
+	for _, route := range configured {
+		seen[routeKey{destination: route.Destination, table: route.Table}] = struct{}{}
+	}
+	for _, route := range discovered {
+		key := routeKey{destination: route.Destination, table: route.Table}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		result = append(result, route)
+		seen[key] = struct{}{}
+	}
+	return result
+}
+
+func routeToConfig(route netlink.Route) (apis.RouteConfig, bool) {
+	destination := ""
+	if route.Dst != nil {
+		destination = route.Dst.String()
+	} else {
+		switch route.Family {
+		case netlink.FAMILY_V4:
+			destination = "0.0.0.0/0"
+		case netlink.FAMILY_V6:
+			destination = "::/0"
+		default:
+			return apis.RouteConfig{}, false
+		}
+	}
+
+	routeCfg := apis.RouteConfig{
+		Destination: destination,
+		Scope:       uint8(route.Scope),
+		Metric:      route.Priority,
+		Table:       route.Table,
+	}
+	if route.Gw != nil {
+		routeCfg.Gateway = route.Gw.String()
+	}
+	if route.Src != nil {
+		routeCfg.Source = route.Src.String()
+	}
+	return routeCfg, true
 }
 
 // getDeviceNetworkConfig merges the user configuration with the cloud provider configuration and resolves the dynamic profile.

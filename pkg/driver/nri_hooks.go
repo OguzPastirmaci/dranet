@@ -260,7 +260,13 @@ func attachNetdevToNS(ctx context.Context, ns, deviceName string, config DeviceC
 	logger.V(2).Info("RunPodSandbox processing Network device")
 	// TODO config options to rename the device and pass parameters
 	// use https://github.com/opencontainers/runtime-spec/pull/1271
-	networkData, err := nsAttachNetdev(ifName, ns, config.NetworkInterfaceConfigInPod.Interface)
+	networkData, err := nsAttachNetdev(
+		ifName,
+		ns,
+		config.NetworkInterfaceConfigInPod.Interface,
+		config.NetworkInterfaceConfigInHost,
+		config.HostInterfaceIPv4Sysctls,
+	)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error moving network device to namespace")
 		return fmt.Errorf("error moving network device %s to namespace %s: %v", deviceName, ns, err)
@@ -403,10 +409,13 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		netdevDetached := false
 		ifName := config.NetworkInterfaceConfigInPod.Interface.Name
 		if ifName != "" {
-			if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
+			moved, err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost, config.HostInterfaceIPv4Sysctls)
+			netdevDetached = moved
+			if err != nil {
 				logger.Error(err, "Failed to return network device", "device", deviceName)
-			} else {
-				netdevDetached = true
+				if moved {
+					needsRescan = true
+				}
 			}
 		}
 

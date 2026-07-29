@@ -19,13 +19,13 @@ package driver
 import (
 	"crypto/rand"
 	"fmt"
+	"net"
 	"os"
-	"os/exec"
 	"path"
 	"runtime"
-	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"k8s.io/utils/ptr"
@@ -105,13 +105,110 @@ func Test_nhNetdev(t *testing.T) {
 		GSOIPv4MaxSize: ptr.To[int32](1026),
 		GROIPv4MaxSize: ptr.To[int32](1027),
 	}
+	hostIPv4Sysctls := &InterfaceIPv4Sysctls{
+		RPFilter:    ptr.To(0),
+		ARPIgnore:   ptr.To(1),
+		ARPAnnounce: ptr.To(2),
+		AcceptLocal: ptr.To(1),
+		ARPFilter:   ptr.To(1),
+	}
+	tableID := 10000 + int(rndString[0])
+	rulePriority := 20000 + int(rndString[1])
+	expectedHostNetworkConfig := apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{Name: ifaceName},
+		Routes: []apis.RouteConfig{
+			{
+				Destination: "198.18.0.0/15",
+				Scope:       uint8(netlink.SCOPE_LINK),
+				Metric:      100,
+				Table:       tableID,
+			},
+		},
+		Rules: []apis.RuleConfig{
+			{Priority: rulePriority, Family: netlink.FAMILY_V4, OifName: ifaceName, Table: tableID},
+			{Priority: rulePriority + 1, Family: netlink.FAMILY_V4, Source: "198.18.0.1/32", Table: tableID},
+			{Priority: rulePriority + 2, Family: netlink.FAMILY_V4, Destination: "198.18.0.1/32", Table: tableID},
+		},
+	}
+	if err := applyInterfaceIPv4Sysctls(ifaceName, hostIPv4Sysctls); err != nil {
+		t.Fatalf("failed to set host IPv4 sysctls: %v", err)
+	}
 
-	deviceData, err := nsAttachNetdev(ifaceName, path.Join("/run/netns", nsName), config)
+	_, policyDestination, err := net.ParseCIDR(expectedHostNetworkConfig.Routes[0].Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.RouteAdd(&netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       policyDestination,
+		Scope:     netlink.SCOPE_LINK,
+		Priority:  expectedHostNetworkConfig.Routes[0].Metric,
+		Table:     tableID,
+	}); err != nil {
+		t.Fatalf("failed to add host policy route: %v", err)
+	}
+	for _, ruleConfig := range expectedHostNetworkConfig.Rules {
+		rule, err := ruleFromConfig(ruleConfig)
+		if err != nil {
+			t.Fatalf("failed to build host policy rule: %v", err)
+		}
+		if err := netlink.RuleAdd(rule); err != nil {
+			t.Fatalf("failed to add host policy rule: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, ruleConfig := range expectedHostNetworkConfig.Rules {
+			rule, err := ruleFromConfig(ruleConfig)
+			if err == nil {
+				_ = netlink.RuleDel(rule)
+			}
+		}
+	})
+
+	hostHandle, err := nlwrap.NewHandle()
+	if err != nil {
+		t.Fatalf("failed to get host netlink handle: %v", err)
+	}
+	defer hostHandle.Close()
+
+	capturedRoutes, tables, err := getRouteInfo(hostHandle, ifaceName, link)
+	if err != nil {
+		t.Fatalf("failed to capture host policy routes: %v", err)
+	}
+	if !tables.Has(tableID) {
+		t.Fatalf("captured route tables do not include %d: %v", tableID, tables)
+	}
+	rulesByTable, err := getRuleInfo(hostHandle)
+	if err != nil {
+		t.Fatalf("failed to capture host policy rules: %v", err)
+	}
+	hostNetworkConfig := apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{Name: ifaceName},
+		Routes:    capturedRoutes,
+		Rules:     rulesByTable[tableID],
+	}
+	if diff := cmp.Diff(expectedHostNetworkConfig, hostNetworkConfig); diff != "" {
+		t.Fatalf("captured host policy routing mismatch (-want +got):\n%s", diff)
+	}
+
+	deviceData, err := nsAttachNetdev(
+		ifaceName,
+		path.Join("/run/netns", nsName),
+		config,
+		hostNetworkConfig,
+		hostIPv4Sysctls,
+	)
 	if err != nil {
 		t.Fatalf("fail to attach netdev to namespace: %v", err)
 	}
+	if err := applyRoutingConfig(path.Join("/run/netns", nsName), config.Name, hostNetworkConfig.Routes, 0); err != nil {
+		t.Fatalf("failed to apply pod policy route: %v", err)
+	}
+	podRules := translateRuleInterfaceNames(hostNetworkConfig.Rules, ifaceName, config.Name)
+	if err := applyRulesConfig(path.Join("/run/netns", nsName), podRules); err != nil {
+		t.Fatalf("failed to apply pod policy rules: %v", err)
+	}
 
-	// check against  ip lin
 	func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
@@ -119,51 +216,80 @@ func Test_nhNetdev(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cmd := exec.Command("ip", "-d", "link", "show", config.Name)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("not able to use ethtool from namespace: %v", err)
-		}
-		outputStr := string(output)
 
-		if !strings.Contains(outputStr, fmt.Sprintf("mtu %d", *config.MTU)) {
-			t.Errorf("mtu not changed %s", outputStr)
+		nsLink, err := nhNs.LinkByName(config.Name)
+		if err != nil {
+			t.Fatalf("failed to get pod interface: %v", err)
 		}
-		if !strings.Contains(outputStr, fmt.Sprintf("gso_max_size %d", *config.GSOMaxSize)) {
-			t.Errorf("GSOMaxSize not changed wanted %s got %s", fmt.Sprintf("gso_max_size %d", *config.GSOMaxSize), outputStr)
+		attrs := nsLink.Attrs()
+		if attrs.MTU != int(*config.MTU) {
+			t.Errorf("MTU mismatch: want %d, got %d", *config.MTU, attrs.MTU)
 		}
-		if !strings.Contains(outputStr, fmt.Sprintf("gro_max_size %d", *config.GROMaxSize)) {
-			t.Errorf("GROMaxSize not changed %s", outputStr)
+		if attrs.GSOMaxSize != uint32(*config.GSOMaxSize) {
+			t.Errorf("GSOMaxSize mismatch: want %d, got %d", *config.GSOMaxSize, attrs.GSOMaxSize)
 		}
-		// require iproute 6.3.0+
-		// TODO: validate the ip version to check it
-		// https://github.com/iproute2/iproute2/commit/1dafe448c7a2f2be5dfddd8da250980708a48c41
-		/*
-			if !strings.Contains(outputStr, fmt.Sprintf("gso_ipv4_max_size %d", *config.GSOIPv4MaxSize)) {
-				t.Errorf("GSOIPv4MaxSize not changed %s", outputStr)
-			}
-			if !strings.Contains(outputStr, fmt.Sprintf("gro_ipv4_max_size %d", *config.GROIPv4MaxSize)) {
-				t.Errorf("GROIPv4MaxSize not changed %s", outputStr)
-			}
-		*/
-		if !strings.Contains(outputStr, fmt.Sprintf("link/ether %s", *config.HardwareAddr)) {
-			t.Errorf("HardwareAddr not changed %s", outputStr)
+		if attrs.GROMaxSize != uint32(*config.GROMaxSize) {
+			t.Errorf("GROMaxSize mismatch: want %d, got %d", *config.GROMaxSize, attrs.GROMaxSize)
+		}
+		if attrs.HardwareAddr.String() != *config.HardwareAddr {
+			t.Errorf("hardware address mismatch: want %s, got %s", *config.HardwareAddr, attrs.HardwareAddr)
 		}
 		if *config.HardwareAddr != deviceData.HardwareAddress {
-			t.Errorf("HardwareAddr not reported")
+			t.Errorf("reported hardware address mismatch: want %s, got %s", *config.HardwareAddr, deviceData.HardwareAddress)
 		}
 
-		cmd = exec.Command("ip", "addr", "show", config.Name)
-		output, err = cmd.CombinedOutput()
+		addresses, err := nhNs.AddrList(nsLink, netlink.FAMILY_ALL)
 		if err != nil {
-			t.Fatalf("not able to use ethtool from namespace: %v", err)
+			t.Fatalf("failed to list pod interface addresses: %v", err)
 		}
-		outputStr = string(output)
-		// TODO check reported state
-		for _, addr := range config.Addresses {
-			if !strings.Contains(outputStr, addr) {
-				t.Errorf("address %s not found", addr)
+		for _, wantAddress := range config.Addresses {
+			found := false
+			for _, address := range addresses {
+				if address.IPNet.String() == wantAddress {
+					found = true
+					break
+				}
 			}
+			if !found {
+				t.Errorf("address %s not found in %#v", wantAddress, addresses)
+			}
+		}
+
+		gotIPv4Sysctls, err := readInterfaceIPv4Sysctls(config.Name)
+		if err != nil {
+			t.Fatalf("failed to read IPv4 sysctls in test namespace: %v", err)
+		}
+		if diff := cmp.Diff(hostIPv4Sysctls, gotIPv4Sysctls); diff != "" {
+			t.Errorf("IPv4 sysctls in test namespace mismatch (-want +got):\n%s", diff)
+		}
+
+		routes, err := nhNs.RouteListFiltered(
+			netlink.FAMILY_V4,
+			&netlink.Route{Table: tableID},
+			netlink.RT_FILTER_TABLE,
+		)
+		if err != nil {
+			t.Fatalf("failed to list pod policy routes: %v", err)
+		}
+		if len(routes) != 1 ||
+			routes[0].Dst == nil ||
+			routes[0].Dst.String() != hostNetworkConfig.Routes[0].Destination ||
+			routes[0].Priority != hostNetworkConfig.Routes[0].Metric {
+			t.Fatalf("pod policy route mismatch: %#v", routes)
+		}
+
+		rules, err := nhNs.RuleList(netlink.FAMILY_V4)
+		if err != nil {
+			t.Fatalf("failed to list pod policy rules: %v", err)
+		}
+		var gotPodRules []apis.RuleConfig
+		for _, rule := range rules {
+			if rule.Table == tableID {
+				gotPodRules = append(gotPodRules, ruleToConfig(rule))
+			}
+		}
+		if diff := cmp.Diff(podRules, gotPodRules); diff != "" {
+			t.Fatalf("pod policy rules mismatch (-want +got):\n%s", diff)
 		}
 
 		// Switch back to the original namespace
@@ -173,9 +299,48 @@ func Test_nhNetdev(t *testing.T) {
 		}
 	}()
 
-	err = nsDetachNetdev(path.Join("/run/netns", nsName), config.Name, ifaceName)
+	_, err = nsDetachNetdev(path.Join("/run/netns", nsName), config.Name, hostNetworkConfig, hostIPv4Sysctls)
 	if err != nil {
 		t.Fatalf("fail to attach netdev to namespace: %v", err)
 	}
+	if err := restoreHostInterfaceConfig(ifaceName, hostNetworkConfig, hostIPv4Sysctls); err != nil {
+		t.Fatalf("failed to retry host interface restoration: %v", err)
+	}
 
+	gotIPv4Sysctls, err := readInterfaceIPv4Sysctls(ifaceName)
+	if err != nil {
+		t.Fatalf("failed to read restored host IPv4 sysctls: %v", err)
+	}
+	if diff := cmp.Diff(hostIPv4Sysctls, gotIPv4Sysctls); diff != "" {
+		t.Errorf("restored host IPv4 sysctls mismatch (-want +got):\n%s", diff)
+	}
+
+	routes, err := hostHandle.RouteListFiltered(
+		netlink.FAMILY_V4,
+		&netlink.Route{Table: tableID},
+		netlink.RT_FILTER_TABLE,
+	)
+	if err != nil {
+		t.Fatalf("failed to list restored host policy routes: %v", err)
+	}
+	if len(routes) != 1 ||
+		routes[0].Dst == nil ||
+		routes[0].Dst.String() != hostNetworkConfig.Routes[0].Destination ||
+		routes[0].Priority != hostNetworkConfig.Routes[0].Metric {
+		t.Fatalf("restored host policy route mismatch: %#v", routes)
+	}
+
+	rules, err := hostHandle.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		t.Fatalf("failed to list restored host policy rules: %v", err)
+	}
+	var gotHostRules []apis.RuleConfig
+	for _, rule := range rules {
+		if rule.Table == tableID {
+			gotHostRules = append(gotHostRules, ruleToConfig(rule))
+		}
+	}
+	if diff := cmp.Diff(hostNetworkConfig.Rules, gotHostRules); diff != "" {
+		t.Fatalf("restored host policy rules mismatch (-want +got):\n%s", diff)
+	}
 }

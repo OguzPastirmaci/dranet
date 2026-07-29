@@ -26,6 +26,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	bolt "go.etcd.io/bbolt"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/dranet/pkg/apis"
 )
 
@@ -154,10 +155,35 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 
 	config := DeviceConfig{
 		Claim: types.NamespacedName{Namespace: "ns1", Name: "claim1"},
+		NetworkInterfaceConfigInHost: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{Name: "eth0"},
+			Routes: []apis.RouteConfig{
+				{
+					Destination: "10.224.0.0/12",
+					Source:      "10.224.6.100",
+					Scope:       uint8(253),
+					Metric:      100,
+					Table:       10,
+				},
+			},
+			Rules: []apis.RuleConfig{
+				{Priority: 10, Family: 2, Protocol: 4, OifName: "eth0", Table: 10},
+				{Priority: 11, Family: 2, Protocol: 4, Source: "10.224.6.100/32", Table: 10},
+				{Priority: 12, Family: 2, Protocol: 4, Destination: "10.224.6.100/32", Table: 10},
+			},
+		},
 		NetworkInterfaceConfigInPod: apis.NetworkConfig{
 			Interface: apis.InterfaceConfig{Name: "eth0-pod"},
 			Routes:    []apis.RouteConfig{{Destination: "10.0.0.0/8", Gateway: "10.0.0.1"}},
 		},
+		HostInterfaceIPv4Sysctls: &InterfaceIPv4Sysctls{
+			RPFilter:    ptr.To(0),
+			ARPIgnore:   ptr.To(1),
+			ARPAnnounce: ptr.To(2),
+			AcceptLocal: ptr.To(1),
+			ARPFilter:   ptr.To(1),
+		},
+		HostRestoreAttemptedAt: 123456789,
 		RDMADevice: RDMAConfig{
 			LinkDev: "mlx5_0",
 			DevChars: []LinuxDevice{
@@ -391,4 +417,3 @@ func TestPodConfigStore_NoCheckpointer(t *testing.T) {
 		t.Errorf("Close() error: %v", err)
 	}
 }
-

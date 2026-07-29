@@ -115,6 +115,8 @@ type RouteConfig struct {
 	// Scope is the scope of the route (e.g., link, host, global).
 	// Refers to Linux route scopes (e.g., 0 for RT_SCOPE_UNIVERSE, 253 for RT_SCOPE_LINK).
 	Scope uint8 `json:"scope,omitempty"`
+	// Metric controls the route preference. Lower values are preferred.
+	Metric int `json:"metric,omitempty"`
 	// Table is the routing table to use for the route.
 	// 0 usually means "unspecified" and defaults to the 'main' table (254) in Linux.
 	//
@@ -134,10 +136,18 @@ type RouteConfig struct {
 type RuleConfig struct {
 	// Priority is the priority of the rule.
 	Priority int `json:"priority,omitempty"`
+	// Family is the address family for the rule.
+	Family int `json:"family,omitempty"`
+	// Protocol identifies the origin of the rule.
+	Protocol uint8 `json:"protocol,omitempty"`
 	// Source is the source IP address for the rule.
 	Source string `json:"source,omitempty"`
 	// Destination is the destination IP address for the rule.
 	Destination string `json:"destination,omitempty"`
+	// IifName is the input interface name for the rule.
+	IifName string `json:"iifName,omitempty"`
+	// OifName is the output interface name for the rule.
+	OifName string `json:"oifName,omitempty"`
 	// Table is the routing table ID to look up if the rule matches.
 	Table int `json:"table,omitempty"`
 }

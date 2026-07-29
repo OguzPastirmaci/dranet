@@ -30,6 +30,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 	"k8s.io/component-helpers/node/util/sysctl"
 	"k8s.io/klog/v2"
 )
@@ -49,9 +50,13 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 	}
 	defer nhNs.Close()
 
+	return applyRoutingConfigWithHandle(nhNs, ifName, containerNsPAth, routeConfig, vrfTable, false)
+}
+
+func applyRoutingConfigWithHandle(nhNs nlwrap.Handle, ifName, namespace string, routeConfig []apis.RouteConfig, vrfTable int, replacePolicyRoutes bool) error {
 	nsLink, err := nhNs.LinkByName(ifName)
 	if err != nil {
-		return fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
+		return fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, namespace, err)
 	}
 
 	errorList := []error{}
@@ -80,6 +85,7 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 		r := netlink.Route{
 			LinkIndex: nsLink.Attrs().Index,
 			Scope:     netlink.Scope(route.Scope),
+			Priority:  route.Metric,
 			Table:     table,
 		}
 
@@ -93,8 +99,14 @@ func applyRoutingConfig(containerNsPAth string, ifName string, routeConfig []api
 		if route.Source != "" {
 			r.Src = net.ParseIP(route.Source)
 		}
-		if err := nhNs.RouteAdd(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
-			errorList = append(errorList, fmt.Errorf("fail to add route %s for interface %s on namespace %s: %w", r.String(), ifName, containerNsPAth, err))
+		var routeErr error
+		if replacePolicyRoutes && table != unix.RT_TABLE_MAIN && table != unix.RT_TABLE_LOCAL && table != unix.RT_TABLE_DEFAULT {
+			routeErr = nhNs.RouteReplace(&r)
+		} else {
+			routeErr = nhNs.RouteAdd(&r)
+		}
+		if routeErr != nil && !errors.Is(routeErr, syscall.EEXIST) {
+			errorList = append(errorList, fmt.Errorf("fail to add route %s for interface %s on namespace %s: %w", r.String(), ifName, namespace, routeErr))
 		}
 
 	}
@@ -157,32 +169,68 @@ func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) err
 	}
 	defer nsHandle.Close()
 
+	return applyRulesConfigWithHandle(nsHandle, containerNsPath, rulesConfig)
+}
+
+func applyRulesConfigWithHandle(nsHandle nlwrap.Handle, namespace string, rulesConfig []apis.RuleConfig) error {
 	errorList := []error{}
 	for _, ruleCfg := range rulesConfig {
-		rule := netlink.NewRule()
-		rule.Priority = ruleCfg.Priority
-		rule.Table = ruleCfg.Table
-
-		if ruleCfg.Source != "" {
-			_, src, err := net.ParseCIDR(ruleCfg.Source)
-			if err != nil {
-				errorList = append(errorList, err)
-				continue
-			}
-			rule.Src = src
-		}
-		if ruleCfg.Destination != "" {
-			_, dst, err := net.ParseCIDR(ruleCfg.Destination)
-			if err != nil {
-				errorList = append(errorList, err)
-				continue
-			}
-			rule.Dst = dst
+		rule, err := ruleFromConfig(ruleCfg)
+		if err != nil {
+			errorList = append(errorList, err)
+			continue
 		}
 
 		if err := nsHandle.RuleAdd(rule); err != nil && !errors.Is(err, syscall.EEXIST) {
-			errorList = append(errorList, fmt.Errorf("failed to add rule %s on namespace %s: %w", rule.String(), containerNsPath, err))
+			errorList = append(errorList, fmt.Errorf("failed to add rule %s on namespace %s: %w", rule.String(), namespace, err))
 		}
+	}
+	return errors.Join(errorList...)
+}
+
+func ruleFromConfig(ruleCfg apis.RuleConfig) (*netlink.Rule, error) {
+	rule := netlink.NewRule()
+	rule.Priority = ruleCfg.Priority
+	rule.Family = ruleCfg.Family
+	rule.Protocol = ruleCfg.Protocol
+	rule.Table = ruleCfg.Table
+	rule.IifName = ruleCfg.IifName
+	rule.OifName = ruleCfg.OifName
+
+	if ruleCfg.Source != "" {
+		_, src, err := net.ParseCIDR(ruleCfg.Source)
+		if err != nil {
+			return nil, err
+		}
+		rule.Src = src
+	}
+	if ruleCfg.Destination != "" {
+		_, dst, err := net.ParseCIDR(ruleCfg.Destination)
+		if err != nil {
+			return nil, err
+		}
+		rule.Dst = dst
+	}
+	return rule, nil
+}
+
+func restoreHostRoutingConfig(ifName string, config apis.NetworkConfig) error {
+	if len(config.Routes) == 0 && len(config.Rules) == 0 {
+		return nil
+	}
+
+	hostHandle, err := nlwrap.NewHandle()
+	if err != nil {
+		return fmt.Errorf("failed to get host netlink handle: %w", err)
+	}
+	defer hostHandle.Close()
+
+	var errorList []error
+	if err := applyRoutingConfigWithHandle(hostHandle, ifName, "host", config.Routes, 0, true); err != nil {
+		errorList = append(errorList, err)
+	}
+	if err := applyRulesConfigWithHandle(hostHandle, "host", config.Rules); err != nil {
+		errorList = append(errorList, err)
 	}
 	return errors.Join(errorList...)
 }
