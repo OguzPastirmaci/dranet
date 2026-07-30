@@ -408,15 +408,10 @@ func (np *NetworkDriver) stopPodSandbox(ctx context.Context, pod *api.PodSandbox
 		netdevDetached := false
 		ifName := config.NetworkInterfaceConfigInPod.Interface.Name
 		if ifName != "" {
-			moved, err := nsDetachNetdev(
-				ns,
-				ifName,
-				config.NetworkInterfaceConfigInHost.Interface.Name,
-				config.HostInterfaceIPv4Sysctls,
-			)
-			netdevDetached = moved
-			if err != nil {
-				logger.Error(err, "Network device return completed with errors", "device", deviceName)
+			if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
+				logger.Error(err, "Failed to return network device", "device", deviceName)
+			} else {
+				netdevDetached = true
 			}
 		}
 
