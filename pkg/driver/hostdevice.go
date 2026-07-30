@@ -33,7 +33,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
+func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig apis.InterfaceConfig, hostIPv4Sysctls *InterfaceIPv4Sysctls) (*resourceapi.NetworkDeviceData, error) {
 	hostDev, err := nlwrap.LinkByName(hostIfName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get link for interface %s: %w", hostIfName, err)
@@ -137,6 +137,11 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		return nil, fmt.Errorf("link not found for interface %s on namespace %s: %w", ifName, containerNsPAth, err)
 	}
 
+	if err := applyInterfaceIPv4SysctlsInNamespace(containerNsPAth, ifName, hostIPv4Sysctls); err != nil {
+		_, rollbackErr := nsDetachNetdev(containerNsPAth, ifName, hostIfName, hostIPv4Sysctls)
+		return nil, fmt.Errorf("failed to apply IPv4 sysctls to interface %s in namespace %s: %w", ifName, containerNsPAth, errors.Join(err, rollbackErr))
+	}
+
 	networkData := &resourceapi.NetworkDeviceData{
 		InterfaceName:   nsLink.Attrs().Name,
 		HardwareAddress: string(nsLink.Attrs().HardwareAddr.String()),
@@ -163,30 +168,30 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	return networkData, nil
 }
 
-func nsDetachNetdev(containerNsPAth string, devName string, outName string) error {
+func nsDetachNetdev(containerNsPAth string, devName string, outName string, hostIPv4Sysctls *InterfaceIPv4Sysctls) (bool, error) {
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
-		return fmt.Errorf("could not get network namespace from path %s for network device %s : %w", containerNsPAth, devName, err)
+		return false, fmt.Errorf("could not get network namespace from path %s for network device %s : %w", containerNsPAth, devName, err)
 	}
 	defer containerNs.Close()
 	// to avoid golang problem with goroutines we create the socket in the
 	// namespace and use it directly
 	nhNs, err := nlwrap.NewHandleAt(containerNs)
 	if err != nil {
-		return fmt.Errorf("could not get network namespace handle: %w", err)
+		return false, fmt.Errorf("could not get network namespace handle: %w", err)
 	}
 	defer nhNs.Close()
 
 	nsLink, err := nhNs.LinkByName(devName)
 	if err != nil {
-		return fmt.Errorf("link not found for interface %s on namespace %s: %w", devName, containerNsPAth, err)
+		return false, fmt.Errorf("link not found for interface %s on namespace %s: %w", devName, containerNsPAth, err)
 	}
 
 	// set the device down to avoid network conflicts
 	// when it is restored to the original namespace
 	err = nhNs.LinkSetDown(nsLink)
 	if err != nil {
-		return fmt.Errorf("failed to set %q down: %w", devName, err)
+		return false, fmt.Errorf("failed to set %q down: %w", devName, err)
 	}
 
 	attrs := nsLink.Attrs()
@@ -197,13 +202,13 @@ func nsDetachNetdev(containerNsPAth string, devName string, outName string) erro
 
 	rootNs, err := netns.Get()
 	if err != nil {
-		return fmt.Errorf("failed to get root network namespace: %w", err)
+		return false, fmt.Errorf("failed to get root network namespace: %w", err)
 	}
 	defer rootNs.Close()
 
 	s, err := nl.GetNetlinkSocketAt(containerNs, rootNs, unix.NETLINK_ROUTE)
 	if err != nil {
-		return fmt.Errorf("could not get network namespace handle: %w", err)
+		return false, fmt.Errorf("could not get network namespace handle: %w", err)
 	}
 	defer s.Close()
 	// copy from netlink.LinkModify(dev) using only the parts needed
@@ -229,17 +234,23 @@ func nsDetachNetdev(containerNsPAth string, devName string, outName string) erro
 
 	_, err = req.Execute(unix.NETLINK_ROUTE, 0)
 	if err != nil {
-		return fmt.Errorf("failed to move interface %s to root namespace: %w", devName, err)
+		return false, fmt.Errorf("failed to move interface %s to root namespace: %w", devName, err)
 	}
 
 	// Set up the interface in case host network workloads depend on it
 	hostDev, err := nlwrap.LinkByName(ifName)
 	if err != nil {
-		return fmt.Errorf("failed to get link for interface %s: %w", ifName, err)
+		return false, fmt.Errorf("failed to get link for interface %s: %w", ifName, err)
+	}
+
+	var errorList []error
+	if err := applyInterfaceIPv4Sysctls(ifName, hostIPv4Sysctls); err != nil {
+		errorList = append(errorList, fmt.Errorf("failed to restore IPv4 sysctls for interface %s: %w", ifName, err))
 	}
 
 	if err = netlink.LinkSetUp(hostDev); err != nil {
-		return fmt.Errorf("failed to set %q up: %w", ifName, err)
+		errorList = append(errorList, fmt.Errorf("failed to set %q up: %w", ifName, err))
+		return false, errors.Join(errorList...)
 	}
-	return nil
+	return true, errors.Join(errorList...)
 }

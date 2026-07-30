@@ -309,6 +309,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 		deviceCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
 
+		hostIPv4Sysctls, err := readInterfaceIPv4Sysctls(ifName)
+		if err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to capture IPv4 sysctls for interface %s: %w", ifName, err))
+			continue
+		}
+		deviceCfg.HostInterfaceIPv4Sysctls = hostIPv4Sysctls
+
 		if deviceCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
 			// If the interface name was not explicitly overridden, use the same
 			// interface name within the pod's network namespace.

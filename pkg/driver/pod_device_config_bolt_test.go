@@ -26,6 +26,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	bolt "go.etcd.io/bbolt"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/dranet/pkg/apis"
 )
 
@@ -157,6 +158,10 @@ func TestPodConfigStore_Persistence(t *testing.T) {
 		NetworkInterfaceConfigInPod: apis.NetworkConfig{
 			Interface: apis.InterfaceConfig{Name: "eth0-pod"},
 			Routes:    []apis.RouteConfig{{Destination: "10.0.0.0/8", Gateway: "10.0.0.1"}},
+		},
+		HostInterfaceIPv4Sysctls: &InterfaceIPv4Sysctls{
+			ARPIgnore:   ptr.To(1),
+			ARPAnnounce: ptr.To(2),
 		},
 		RDMADevice: RDMAConfig{
 			LinkDev: "mlx5_0",
@@ -391,4 +396,3 @@ func TestPodConfigStore_NoCheckpointer(t *testing.T) {
 		t.Errorf("Close() error: %v", err)
 	}
 }
-

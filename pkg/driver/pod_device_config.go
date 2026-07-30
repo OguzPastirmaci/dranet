@@ -57,6 +57,10 @@ type DeviceConfig struct {
 	// network namespace.
 	NetworkInterfaceConfigInHost apis.NetworkConfig `json:"networkInterfaceConfigInHost"`
 
+	// HostInterfaceIPv4Sysctls contains ARP settings captured before the
+	// interface moved out of the host network namespace.
+	HostInterfaceIPv4Sysctls *InterfaceIPv4Sysctls `json:"hostInterfaceIPv4Sysctls,omitempty"`
+
 	// NetworkInterfaceConfigInPod contains all network-related configurations
 	// (interface, routes, ethtool, sysctl) to be applied for this device in the
 	// Pod's namespace.

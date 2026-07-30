@@ -19,6 +19,7 @@ package driver
 import (
 	"crypto/rand"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"k8s.io/utils/ptr"
@@ -105,8 +107,15 @@ func Test_nhNetdev(t *testing.T) {
 		GSOIPv4MaxSize: ptr.To[int32](1026),
 		GROIPv4MaxSize: ptr.To[int32](1027),
 	}
+	hostIPv4Sysctls := &InterfaceIPv4Sysctls{
+		ARPIgnore:   ptr.To(1),
+		ARPAnnounce: ptr.To(2),
+	}
+	if err := applyInterfaceIPv4Sysctls(ifaceName, hostIPv4Sysctls); err != nil {
+		t.Fatalf("failed to configure host IPv4 sysctls: %v", err)
+	}
 
-	deviceData, err := nsAttachNetdev(ifaceName, path.Join("/run/netns", nsName), config)
+	deviceData, err := nsAttachNetdev(ifaceName, path.Join("/run/netns", nsName), config, hostIPv4Sysctls)
 	if err != nil {
 		t.Fatalf("fail to attach netdev to namespace: %v", err)
 	}
@@ -153,6 +162,22 @@ func Test_nhNetdev(t *testing.T) {
 			t.Errorf("HardwareAddr not reported")
 		}
 
+		gotIPv4Sysctls, err := readInterfaceIPv4Sysctls(config.Name)
+		if err != nil {
+			t.Fatalf("failed to read pod IPv4 sysctls: %v", err)
+		}
+		if diff := cmp.Diff(hostIPv4Sysctls, gotIPv4Sysctls); diff != "" {
+			t.Errorf("pod IPv4 sysctls mismatch (-want +got):\n%s", diff)
+		}
+
+		podIPv4Sysctls := &InterfaceIPv4Sysctls{
+			ARPIgnore:   ptr.To(0),
+			ARPAnnounce: ptr.To(0),
+		}
+		if err := applyInterfaceIPv4Sysctls(config.Name, podIPv4Sysctls); err != nil {
+			t.Fatalf("failed to change pod IPv4 sysctls before detach: %v", err)
+		}
+
 		cmd = exec.Command("ip", "addr", "show", config.Name)
 		output, err = cmd.CombinedOutput()
 		if err != nil {
@@ -173,9 +198,59 @@ func Test_nhNetdev(t *testing.T) {
 		}
 	}()
 
-	err = nsDetachNetdev(path.Join("/run/netns", nsName), config.Name, ifaceName)
+	moved, err := nsDetachNetdev(path.Join("/run/netns", nsName), config.Name, ifaceName, hostIPv4Sysctls)
 	if err != nil {
 		t.Fatalf("fail to attach netdev to namespace: %v", err)
 	}
+	if !moved {
+		t.Fatal("network device was not moved back to the host namespace")
+	}
 
+	gotIPv4Sysctls, err := readInterfaceIPv4Sysctls(ifaceName)
+	if err != nil {
+		t.Fatalf("failed to read restored host IPv4 sysctls: %v", err)
+	}
+	if diff := cmp.Diff(hostIPv4Sysctls, gotIPv4Sysctls); diff != "" {
+		t.Errorf("restored host IPv4 sysctls mismatch (-want +got):\n%s", diff)
+	}
+
+	errorConfig := config
+	errorConfig.Addresses = nil
+	if _, err := nsAttachNetdev(ifaceName, path.Join("/run/netns", nsName), errorConfig, hostIPv4Sysctls); err != nil {
+		t.Fatalf("failed to reattach netdev for restore error test: %v", err)
+	}
+
+	invalidHostIPv4Sysctls := *hostIPv4Sysctls
+	invalidHostIPv4Sysctls.ARPIgnore = ptr.To(2_147_483_648)
+	moved, err = nsDetachNetdev(path.Join("/run/netns", nsName), errorConfig.Name, ifaceName, &invalidHostIPv4Sysctls)
+	if !moved {
+		t.Fatal("network device was not moved back after sysctl restore error")
+	}
+	if err == nil || !strings.Contains(err.Error(), "arp_ignore") {
+		t.Fatalf("nsDetachNetdev() error = %v, want arp_ignore restore error", err)
+	}
+	if err := applyInterfaceIPv4Sysctls(ifaceName, hostIPv4Sysctls); err != nil {
+		t.Fatalf("failed to recover host IPv4 sysctls: %v", err)
+	}
+
+	invalidAttachIPv4Sysctls := *hostIPv4Sysctls
+	invalidAttachIPv4Sysctls.ARPIgnore = ptr.To(2_147_483_648)
+	if _, err := nsAttachNetdev(
+		ifaceName,
+		path.Join("/run/netns", nsName),
+		errorConfig,
+		&invalidAttachIPv4Sysctls,
+	); err == nil || !strings.Contains(err.Error(), "arp_ignore") {
+		t.Fatalf("nsAttachNetdev() error = %v, want arp_ignore apply error", err)
+	}
+	returnedDev, err := nlwrap.LinkByName(ifaceName)
+	if err != nil {
+		t.Fatalf("network device was not returned after sysctl apply error: %v", err)
+	}
+	if returnedDev.Attrs().Flags&net.FlagUp == 0 {
+		t.Fatal("network device was not brought up after sysctl apply error")
+	}
+	if err := applyInterfaceIPv4Sysctls(ifaceName, hostIPv4Sysctls); err != nil {
+		t.Fatalf("failed to recover host IPv4 sysctls after attach rollback: %v", err)
+	}
 }
