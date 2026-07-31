@@ -23,11 +23,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -46,7 +49,20 @@ const (
 
 	// imdsEndpoint is the Oracle Cloud Instance Metadata Service endpoint.
 	imdsEndpoint = "http://169.254.169.254/opc/v2"
+
+	// arp_ignore=1: only answer ARP for addresses configured on the incoming
+	// interface. arp_announce=2: use an address from the outgoing interface's
+	// subnet as the ARP source. See the kernel ip-sysctl reference.
+	arpIgnoreReplyOwnAddresses   = 1
+	arpAnnounceUseOutgoingSubnet = 2
+
+	// fabricInterfacePrefix is how Oracle Cloud Agent names the RDMA fabric
+	// interfaces through its udev rules: rdma0, rdma1, and so on.
+	fabricInterfacePrefix = "rdma"
 )
+
+// sysfsPCIDevices is a variable so tests can point it at a temporary tree.
+var sysfsPCIDevices = "/sys/bus/pci/devices"
 
 // imdsHostRDMATopologyData contains the RDMA topology fields from the OCI
 // IMDS host metadata response. This is only populated when RDMA topology
@@ -128,10 +144,70 @@ func ocidSuffix(s string) (string, error) {
 	return suffix, nil
 }
 
-// GetDeviceConfig returns nil as OCI does not provide device-specific
-// network configuration through IMDS.
+// GetDeviceConfig returns the ARP settings the OCI RDMA fabric requires.
+//
+// Fabric interfaces on an OCI bare metal shape all share one IP subnet, so an
+// interface must only answer ARP for its own address and must source ARP
+// requests from the outgoing interface. Oracle Cloud Agent configures this on
+// the host, but the kernel resets both values when the interface moves into a
+// Pod, so they are requested again here.
+//
+// A ResourceClaim can override either value. Note that MergeNetworkConfig
+// compares pointed-to values, so it treats an explicit 0 as unset and the
+// default below survives. Overriding to 0 is not possible today.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
-	return nil
+	// The RDMA capability attribute is not a usable discriminator here: on a
+	// bare metal shape the primary VNIC and the VNIC VLAN interfaces are also
+	// RDMA capable, and none of them belong to the fabric. The interface name
+	// is what separates them, and it has to come from sysfs because the DRA
+	// device name is normalized to a DNS-1123 label.
+	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	if err != nil {
+		// The interface is not on the host right now, most likely because it is
+		// already attached to a Pod. The next inventory scan picks it up when it
+		// comes back.
+		return nil
+	}
+	if !isFabricInterface(ifName) {
+		return nil
+	}
+
+	return &apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{
+			ARPIgnore:   ptr.To[int32](arpIgnoreReplyOwnAddresses),
+			ARPAnnounce: ptr.To[int32](arpAnnounceUseOutgoingSubnet),
+		},
+	}
+}
+
+// isFabricInterface reports whether the name is the fabric prefix followed by
+// digits, so it matches rdma0 but not eth1 or a name that merely starts with
+// the prefix.
+func isFabricInterface(ifName string) bool {
+	index, ok := strings.CutPrefix(ifName, fabricInterfacePrefix)
+	if !ok || index == "" {
+		return false
+	}
+	for _, r := range index {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func interfaceNameForPCIAddress(pciAddress string) (string, error) {
+	if pciAddress == "" {
+		return "", errors.New("device has no PCI address")
+	}
+	entries, err := os.ReadDir(filepath.Join(sysfsPCIDevices, pciAddress, "net"))
+	if err != nil {
+		return "", err
+	}
+	if len(entries) != 1 {
+		return "", errors.New("expected exactly one network interface for the PCI device")
+	}
+	return entries[0].Name(), nil
 }
 
 // OnOKE returns true if running on an Oracle Cloud Infrastructure instance.
