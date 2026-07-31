@@ -23,11 +23,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"sigs.k8s.io/dranet/pkg/apis"
@@ -46,6 +51,16 @@ const (
 
 	// imdsEndpoint is the Oracle Cloud Instance Metadata Service endpoint.
 	imdsEndpoint = "http://169.254.169.254/opc/v2"
+
+	// RDMAProfile is the profile name a ResourceClaim sets to ask for the host
+	// ARP configuration of an OCI RDMA interface.
+	RDMAProfile = "oke-rdma"
+)
+
+// Paths are variables so tests can point them at a temporary tree.
+var (
+	sysfsPCIDevices    = "/sys/bus/pci/devices"
+	procSysNetIPv4Conf = "/proc/sys/net/ipv4/conf"
 )
 
 // imdsHostRDMATopologyData contains the RDMA topology fields from the OCI
@@ -132,6 +147,90 @@ func ocidSuffix(s string) (string, error) {
 // network configuration through IMDS.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
 	return nil
+}
+
+var _ cloudprovider.ProfileProvider = (*OKEInstance)(nil)
+
+// GetProfileConfig returns the ARP settings the interface currently has on the
+// host. RDMA interfaces on an OCI bare metal shape all share one IP subnet, and
+// Oracle Cloud Agent configures arp_ignore and arp_announce so an interface only
+// answers ARP for its own address and sources requests from the outgoing
+// interface. The kernel resets both when the interface moves into a Pod, so the
+// values are read here, while the host still owns the interface, and applied
+// again on the other side.
+//
+// A ResourceClaim can override either value. Note that MergeNetworkConfig
+// compares pointed-to values, so it treats an explicit 0 as unset and the host
+// value below survives. Overriding to 0 is not possible today.
+func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+	if config == nil {
+		return nil, fmt.Errorf("no configuration provided for device %s", id.Name)
+	}
+	if config.Profile != RDMAProfile {
+		return nil, fmt.Errorf("unsupported profile %q for device %s, the OKE provider only supports %q", config.Profile, id.Name, RDMAProfile)
+	}
+
+	// The DRA device name is normalized to a DNS-1123 label and is not usable
+	// as an interface name, so resolve the real one through sysfs.
+	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	if err != nil {
+		return nil, fmt.Errorf("could not resolve the interface name for device %s: %w", id.Name, err)
+	}
+
+	arpIgnore, err := readARPSysctl(ifName, "arp_ignore")
+	if err != nil {
+		return nil, err
+	}
+	arpAnnounce, err := readARPSysctl(ifName, "arp_announce")
+	if err != nil {
+		return nil, err
+	}
+
+	return &apis.NetworkConfig{
+		Interface: apis.InterfaceConfig{
+			ARPIgnore:   arpIgnore,
+			ARPAnnounce: arpAnnounce,
+		},
+	}, nil
+}
+
+// ReleaseProfileConfig is a no-op. Reading the host ARP settings allocates
+// nothing, so there is nothing to hand back.
+func (o *OKEInstance) ReleaseProfileConfig(id cloudprovider.DeviceIdentifiers, claimUID types.UID, config *apis.NetworkConfig) error {
+	return nil
+}
+
+func interfaceNameForPCIAddress(pciAddress string) (string, error) {
+	if pciAddress == "" {
+		return "", errors.New("device has no PCI address")
+	}
+	netDir := filepath.Join(sysfsPCIDevices, pciAddress, "net")
+	entries, err := os.ReadDir(netDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to list %s: %w", netDir, err)
+	}
+	if len(entries) != 1 {
+		return "", fmt.Errorf("expected one network interface in %s, found %d", netDir, len(entries))
+	}
+	return entries[0].Name(), nil
+}
+
+// readARPSysctl returns nil when the setting does not exist, so an interface
+// without it is left alone rather than failing the claim.
+func readARPSysctl(ifName, setting string) (*int32, error) {
+	name := filepath.Join(procSysNetIPv4Conf, ifName, setting)
+	data, err := os.ReadFile(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", name, err)
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %w", name, err)
+	}
+	return ptr.To(int32(value)), nil
 }
 
 // OnOKE returns true if running on an Oracle Cloud Infrastructure instance.
