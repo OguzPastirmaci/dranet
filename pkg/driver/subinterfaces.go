@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -56,7 +57,7 @@ func addMacVlan(containerNsPath string, devName string, mode netlink.MacvlanMode
 	return nil
 }
 
-func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandle, config *apis.SubInterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
+func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandle, config *apis.SubInterfaceConfig, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
 	var mode netlink.IPVlanMode
 	var flag netlink.IPVlanFlag
 	if config != nil && config.IPVlan != nil {
@@ -105,6 +106,12 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 		return nil, fmt.Errorf("link not found for interface %s: %w", ifName, err)
 	}
 
+	// Apply the ARP policy before the child comes up.
+	if err := applyInterfaceARPConfig(containerNs, ifName, interfaceConfig); err != nil {
+		cleanupErr := nhNs.LinkDel(nsLink)
+		return nil, fmt.Errorf("failed to apply ARP configuration to ipvlan interface %s: %w", ifName, errors.Join(err, cleanupErr))
+	}
+
 	networkData := &resourceapi.NetworkDeviceData{
 		InterfaceName:   nsLink.Attrs().Name,
 		HardwareAddress: nsLink.Attrs().HardwareAddr.String(),
@@ -133,7 +140,7 @@ func addIPVlan(ifName string, parentLink netlink.Link, containerNs netns.NsHandl
 
 // nsCreateSubinterface creates a subinterface (currently supports IPVLAN) of hostIfName
 // directly in the container network namespace and configures it with the specified addresses.
-func nsCreateSubinterface(hostIfName string, containerNsPath string, subInterfaceConfig *apis.SubInterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
+func nsCreateSubinterface(hostIfName string, containerNsPath string, subInterfaceConfig *apis.SubInterfaceConfig, interfaceConfig apis.InterfaceConfig) (*resourceapi.NetworkDeviceData, error) {
 	containerNs, err := netns.GetFromPath(containerNsPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container network namespace %s: %w", containerNsPath, err)
@@ -161,7 +168,7 @@ func nsCreateSubinterface(hostIfName string, containerNsPath string, subInterfac
 	var networkData *resourceapi.NetworkDeviceData
 	// We only support creating IPVlan subinterface right now.
 	if subInterfaceConfig.Type == apis.SubInterfaceTypeIPVlan {
-		networkData, err = addIPVlan(ifName, parentLink, containerNs, subInterfaceConfig)
+		networkData, err = addIPVlan(ifName, parentLink, containerNs, subInterfaceConfig, interfaceConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create the %s ipvlan interface on namespace %s: %w", ifName, containerNsPath, err)
 		}

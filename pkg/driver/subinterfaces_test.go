@@ -29,6 +29,9 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"k8s.io/component-helpers/node/util/sysctl"
+	sysctltesting "k8s.io/component-helpers/node/util/sysctl/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/dranet/internal/nlwrap"
 	"sigs.k8s.io/dranet/pkg/apis"
 )
@@ -115,7 +118,11 @@ func TestSubinterface_IPVlan(t *testing.T) {
 		Type:      "ipvlan",
 	}
 
-	deviceData, err := nsCreateSubinterface(ifaceName, path.Join("/run/netns", nsName), config)
+	interfaceConfig := apis.InterfaceConfig{
+		ARPIgnore:   ptr.To[int32](1),
+		ARPAnnounce: ptr.To[int32](2),
+	}
+	deviceData, err := nsCreateSubinterface(ifaceName, path.Join("/run/netns", nsName), config, interfaceConfig)
 	if err != nil {
 		t.Fatalf("fail to create subinterface: %v", err)
 	}
@@ -188,6 +195,16 @@ func TestSubinterface_IPVlan(t *testing.T) {
 				t.Errorf("expected address %s not found in ip addr show:\n%s", addr, outputStr)
 			}
 		}
+
+		for setting, want := range map[string]string{"arp_ignore": "1", "arp_announce": "2"} {
+			value, err := os.ReadFile(path.Join("/proc/sys/net/ipv4/conf", config.Name, setting))
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", setting, err)
+			}
+			if got := strings.TrimSpace(string(value)); got != want {
+				t.Errorf("%s = %s, want %s", setting, got, want)
+			}
+		}
 	}()
 
 	// Phase 5: Call nsDeleteSubinterface for teardown.
@@ -212,4 +229,22 @@ func TestSubinterface_IPVlan(t *testing.T) {
 			t.Errorf("expected subinterface %s to be deleted, but it still exists: %s", config.Name, string(output))
 		}
 	}()
+
+	// Phase 6: Verify that an ARP failure removes the new child.
+	originalSysctlProvider := sysctlProvider
+	sysctlProvider = func() sysctl.Interface {
+		return &failingSetSysctl{
+			Fake:    sysctltesting.NewFake(),
+			setting: "net/ipv4/conf/dranet0/arp_ignore",
+		}
+	}
+	t.Cleanup(func() { sysctlProvider = originalSysctlProvider })
+
+	_, err = nsCreateSubinterface(ifaceName, path.Join("/run/netns", nsName), config, interfaceConfig)
+	if err == nil || !strings.Contains(err.Error(), "arp_ignore") {
+		t.Fatalf("nsCreateSubinterface() error = %v, want arp_ignore failure", err)
+	}
+	if _, err := nhNs.LinkByName(config.Name); err == nil {
+		t.Errorf("subinterface %s still exists after ARP failure", config.Name)
+	}
 }

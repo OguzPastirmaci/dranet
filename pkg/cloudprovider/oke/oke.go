@@ -23,6 +23,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +40,8 @@ import (
 const (
 	OKEAttrPrefix = "oke.dra.net"
 
+	fabricInterfacePrefix = "rdma"
+
 	// RDMA topology attributes (from /opc/v2/host/).
 	AttrOKEHPCIslandId     = OKEAttrPrefix + "/" + "hpcIslandId"
 	AttrOKENetworkBlockId  = OKEAttrPrefix + "/" + "networkBlockId"
@@ -46,6 +51,11 @@ const (
 
 	// imdsEndpoint is the Oracle Cloud Instance Metadata Service endpoint.
 	imdsEndpoint = "http://169.254.169.254/opc/v2"
+)
+
+var (
+	sysfsPCIDevices    = "/sys/bus/pci/devices"
+	procSysNetIPv4Conf = "/proc/sys/net/ipv4/conf"
 )
 
 // imdsHostRDMATopologyData contains the RDMA topology fields from the OCI
@@ -128,10 +138,85 @@ func ocidSuffix(s string) (string, error) {
 	return suffix, nil
 }
 
-// GetDeviceConfig returns nil as OCI does not provide device-specific
-// network configuration through IMDS.
+// GetDeviceConfig keeps OKE fabric interfaces on the host and applies the
+// parent ARP policy to the ipvlan child.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
-	return nil
+	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	if err != nil || !isFabricInterface(ifName) {
+		return nil
+	}
+
+	config := &apis.NetworkConfig{
+		SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
+	}
+
+	arpIgnore, err := readARPSysctl(ifName, "arp_ignore")
+	if err != nil {
+		klog.Warningf("Could not read OKE arp_ignore for device %s: %v", id.Name, err)
+	} else {
+		config.Interface.ARPIgnore = arpIgnore
+	}
+
+	arpAnnounce, err := readARPSysctl(ifName, "arp_announce")
+	if err != nil {
+		klog.Warningf("Could not read OKE arp_announce for device %s: %v", id.Name, err)
+	} else {
+		config.Interface.ARPAnnounce = arpAnnounce
+	}
+
+	return config
+}
+
+func isFabricInterface(ifName string) bool {
+	index, ok := strings.CutPrefix(ifName, fabricInterfacePrefix)
+	if !ok || index == "" {
+		return false
+	}
+	for _, r := range index {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func interfaceNameForPCIAddress(pciAddress string) (string, error) {
+	if pciAddress == "" {
+		return "", errors.New("device has no PCI address")
+	}
+	entries, err := os.ReadDir(filepath.Join(sysfsPCIDevices, pciAddress, "net"))
+	if err != nil {
+		return "", fmt.Errorf("could not read network interfaces for PCI device %s: %w", pciAddress, err)
+	}
+	if len(entries) != 1 {
+		return "", fmt.Errorf("expected one network interface for PCI device %s, got %d", pciAddress, len(entries))
+	}
+	return entries[0].Name(), nil
+}
+
+func readARPSysctl(ifName, setting string) (*int32, error) {
+	name := filepath.Join(procSysNetIPv4Conf, ifName, setting)
+	data, err := os.ReadFile(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not read %s: %w", name, err)
+	}
+
+	value, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse %s: %w", name, err)
+	}
+	if setting == "arp_ignore" && value != 0 && value != 1 && value != 2 && value != 3 && value != 8 {
+		return nil, fmt.Errorf("%s has unsupported value %d", name, value)
+	}
+	if setting == "arp_announce" && (value < 0 || value > 2) {
+		return nil, fmt.Errorf("%s has unsupported value %d", name, value)
+	}
+
+	result := int32(value)
+	return &result, nil
 }
 
 // OnOKE returns true if running on an Oracle Cloud Infrastructure instance.

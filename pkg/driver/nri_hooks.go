@@ -298,7 +298,12 @@ func createSubinterfaceInNS(ctx context.Context, ns, deviceName string, config D
 	hostIfName := config.NetworkInterfaceConfigInHost.Interface.Name
 	logger.V(2).Info("RunPodSandbox creating subinterface on parent device", "parentDevice", hostIfName)
 
-	networkData, err := nsCreateSubinterface(hostIfName, ns, config.NetworkInterfaceConfigInPod.SubInterface)
+	networkData, err := nsCreateSubinterface(
+		hostIfName,
+		ns,
+		config.NetworkInterfaceConfigInPod.SubInterface,
+		config.NetworkInterfaceConfigInPod.Interface,
+	)
 	if err != nil {
 		logger.Error(err, "RunPodSandbox error creating subinterface", "parentDevice", hostIfName, "netns", ns)
 		return fmt.Errorf("error creating subinterface on parent %s in namespace %s: %v", hostIfName, ns, err)

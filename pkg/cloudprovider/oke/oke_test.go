@@ -17,8 +17,11 @@ limitations under the License.
 package oke
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 
 	"github.com/google/go-cmp/cmp"
@@ -170,13 +173,80 @@ func TestOCIDSuffix(t *testing.T) {
 }
 
 func TestGetDeviceConfig(t *testing.T) {
-	instance := &OKEInstance{
-		HPCIslandId:    "fake-island-id",
-		NetworkBlockId: "fake-network-block-id",
-		RackId:         "fake-rack-id",
+	originalSysfs := sysfsPCIDevices
+	originalProc := procSysNetIPv4Conf
+	sysfsPCIDevices = t.TempDir()
+	procSysNetIPv4Conf = t.TempDir()
+	t.Cleanup(func() {
+		sysfsPCIDevices = originalSysfs
+		procSysNetIPv4Conf = originalProc
+	})
+
+	addDevice := func(pciAddress, ifName string, arpIgnore, arpAnnounce *string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(sysfsPCIDevices, pciAddress, "net", ifName), 0o755); err != nil {
+			t.Fatalf("failed to create fake sysfs: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(procSysNetIPv4Conf, ifName), 0o755); err != nil {
+			t.Fatalf("failed to create fake proc sys: %v", err)
+		}
+		for setting, value := range map[string]*string{"arp_ignore": arpIgnore, "arp_announce": arpAnnounce} {
+			if value == nil {
+				continue
+			}
+			if err := os.WriteFile(filepath.Join(procSysNetIPv4Conf, ifName, setting), []byte(*value), 0o644); err != nil {
+				t.Fatalf("failed to write fake %s: %v", setting, err)
+			}
+		}
 	}
-	got := instance.GetDeviceConfig(cloudprovider.DeviceIdentifiers{Name: "dev1"})
-	if got != nil {
-		t.Errorf("GetDeviceConfig() = %v, want nil", got)
+
+	one := "1"
+	two := "2"
+	four := "4"
+	addDevice("0000:0c:00.0", "rdma0", &one, &two)
+	addDevice("0000:0d:00.0", "eth0", &one, &two)
+	addDevice("0000:0e:00.0", "rdma1", &four, &two)
+
+	tests := []struct {
+		name string
+		id   cloudprovider.DeviceIdentifiers
+		want *apis.NetworkConfig
+	}{
+		{
+			name: "fabric interface",
+			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-0c-00-0", PCIAddress: "0000:0c:00.0"},
+			want: &apis.NetworkConfig{
+				Interface: apis.InterfaceConfig{
+					ARPIgnore:   ptr.To[int32](1),
+					ARPAnnounce: ptr.To[int32](2),
+				},
+				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
+			},
+		},
+		{
+			name: "non-fabric interface",
+			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-0d-00-0", PCIAddress: "0000:0d:00.0"},
+		},
+		{
+			name: "missing PCI address",
+			id:   cloudprovider.DeviceIdentifiers{Name: "dev1"},
+		},
+		{
+			name: "invalid ARP value keeps ipvlan",
+			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-0e-00-0", PCIAddress: "0000:0e:00.0"},
+			want: &apis.NetworkConfig{
+				Interface:    apis.InterfaceConfig{ARPAnnounce: ptr.To[int32](2)},
+				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := (&OKEInstance{}).GetDeviceConfig(tt.id)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("GetDeviceConfig() mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
