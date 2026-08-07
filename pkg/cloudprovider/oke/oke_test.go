@@ -17,6 +17,8 @@ limitations under the License.
 package oke
 
 import (
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -216,6 +218,7 @@ func TestGetDeviceConfig(t *testing.T) {
 			name: "fabric interface",
 			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-0c-00-0", PCIAddress: "0000:0c:00.0"},
 			want: &apis.NetworkConfig{
+				Profile: okeRDMAIPv4Profile,
 				Interface: apis.InterfaceConfig{
 					ARPIgnore:   ptr.To[int32](1),
 					ARPAnnounce: ptr.To[int32](2),
@@ -235,6 +238,7 @@ func TestGetDeviceConfig(t *testing.T) {
 			name: "invalid ARP value keeps ipvlan",
 			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-0e-00-0", PCIAddress: "0000:0e:00.0"},
 			want: &apis.NetworkConfig{
+				Profile:      okeRDMAIPv4Profile,
 				Interface:    apis.InterfaceConfig{ARPAnnounce: ptr.To[int32](2)},
 				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
 			},
@@ -246,6 +250,194 @@ func TestGetDeviceConfig(t *testing.T) {
 			got := (&OKEInstance{}).GetDeviceConfig(tt.id)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("GetDeviceConfig() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGetProfileConfig(t *testing.T) {
+	originalSysfs := sysfsPCIDevices
+	originalInterfaceAddresses := interfaceAddresses
+	sysfsPCIDevices = t.TempDir()
+	t.Cleanup(func() {
+		sysfsPCIDevices = originalSysfs
+		interfaceAddresses = originalInterfaceAddresses
+	})
+
+	addDevice := func(pciAddress, ifName string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(sysfsPCIDevices, pciAddress, "net", ifName), 0o755); err != nil {
+			t.Fatalf("failed to create fake sysfs: %v", err)
+		}
+	}
+	addDevice("0000:0c:00.0", "rdma0")
+	addDevice("0000:0d:00.0", "rdma15")
+	addDevice("0000:0e:00.0", "rdma16")
+	addDevice("0000:0f:00.0", "eth0")
+	addDevice("0000:10:00.0", "rdma1")
+
+	interfaceAddresses = func(ifName string) ([]net.Addr, error) {
+		addresses := map[string]string{
+			"rdma0":  "10.224.6.100/12",
+			"rdma15": "10.225.230.100/12",
+			"rdma16": "10.225.250.100/12",
+			"eth0":   "10.140.70.100/19",
+			"rdma1":  "10.226.6.100/12",
+		}
+		cidr, ok := addresses[ifName]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		ip, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, err
+		}
+		network.IP = ip
+		return []net.Addr{network}, nil
+	}
+
+	baseConfig := &apis.NetworkConfig{
+		Profile:      okeRDMAIPv4Profile,
+		SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
+	}
+	tests := []struct {
+		name    string
+		id      cloudprovider.DeviceIdentifiers
+		config  *apis.NetworkConfig
+		want    *apis.NetworkConfig
+		wantErr bool
+	}{
+		{
+			name:   "first rail",
+			id:     cloudprovider.DeviceIdentifiers{Name: "pci-0000-0c-00-0", PCIAddress: "0000:0c:00.0"},
+			config: baseConfig,
+			want: &apis.NetworkConfig{
+				SubInterface: &apis.SubInterfaceConfig{Addresses: []string{"10.240.6.100/15"}},
+				Routes: []apis.RouteConfig{{
+					Destination: "10.240.0.0/15",
+					Source:      "10.240.6.100",
+					Scope:       253,
+					Table:       100,
+				}},
+				Rules: []apis.RuleConfig{{Priority: 32000, Source: "10.240.6.100/32", Table: 100}},
+			},
+		},
+		{
+			name:   "last rail",
+			id:     cloudprovider.DeviceIdentifiers{Name: "pci-0000-0d-00-0", PCIAddress: "0000:0d:00.0"},
+			config: baseConfig,
+			want: &apis.NetworkConfig{
+				SubInterface: &apis.SubInterfaceConfig{Addresses: []string{"10.241.230.100/15"}},
+				Routes: []apis.RouteConfig{{
+					Destination: "10.240.0.0/15",
+					Source:      "10.241.230.100",
+					Scope:       253,
+					Table:       115,
+				}},
+				Rules: []apis.RuleConfig{{Priority: 32000, Source: "10.241.230.100/32", Table: 115}},
+			},
+		},
+		{
+			name:    "unsupported profile",
+			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-0c-00-0", PCIAddress: "0000:0c:00.0"},
+			config:  &apis.NetworkConfig{Profile: "other", SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan}},
+			wantErr: true,
+		},
+		{
+			name:    "profile requires ipvlan",
+			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-0c-00-0", PCIAddress: "0000:0c:00.0"},
+			config:  &apis.NetworkConfig{Profile: okeRDMAIPv4Profile},
+			wantErr: true,
+		},
+		{
+			name:    "rail outside supported range",
+			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-0e-00-0", PCIAddress: "0000:0e:00.0"},
+			config:  baseConfig,
+			wantErr: true,
+		},
+		{
+			name:    "non-fabric interface",
+			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-0f-00-0", PCIAddress: "0000:0f:00.0"},
+			config:  baseConfig,
+			wantErr: true,
+		},
+		{
+			name:    "parent address outside source range",
+			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-10-00-0", PCIAddress: "0000:10:00.0"},
+			config:  baseConfig,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := (&OKEInstance{}).GetProfileConfig(tt.id, "claim-uid", tt.config)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("GetProfileConfig() returned no error, got %#v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetProfileConfig() returned error: %v", err)
+			}
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("GetProfileConfig() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestTranslateIPv4Address(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		source  string
+		target  string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "preserves host bits",
+			address: "10.225.230.100",
+			source:  "10.224.0.0/15",
+			target:  "10.240.0.0/15",
+			want:    "10.241.230.100",
+		},
+		{
+			name:    "address outside source",
+			address: "10.226.0.1",
+			source:  "10.224.0.0/15",
+			target:  "10.240.0.0/15",
+			wantErr: true,
+		},
+		{
+			name:    "different prefix lengths",
+			address: "10.224.0.1",
+			source:  "10.224.0.0/15",
+			target:  "10.240.0.0/16",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := translateIPv4Address(
+				netip.MustParseAddr(tt.address),
+				netip.MustParsePrefix(tt.source),
+				netip.MustParsePrefix(tt.target),
+			)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("translateIPv4Address() = %s, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("translateIPv4Address() returned error: %v", err)
+			}
+			if got.String() != tt.want {
+				t.Errorf("translateIPv4Address() = %s, want %s", got, tt.want)
 			}
 		})
 	}

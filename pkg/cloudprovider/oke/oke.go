@@ -18,17 +18,21 @@ package oke
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 
@@ -41,6 +45,14 @@ const (
 	OKEAttrPrefix = "oke.dra.net"
 
 	fabricInterfacePrefix = "rdma"
+	okeRDMAIPv4Profile    = "oke-rdma-ipv4"
+	okeRDMASBRTableBase   = 100
+	okeRDMAMaxRailIndex   = 15
+
+	// OCA assigns B4 RDMA parent addresses from this /15. DRANET uses a
+	// separate /15 for one deterministic IPvlan child per parent.
+	okeRDMAParentIPv4CIDR = "10.224.0.0/15"
+	okeRDMAChildIPv4CIDR  = "10.240.0.0/15"
 
 	// RDMA topology attributes (from /opc/v2/host/).
 	AttrOKEHPCIslandId     = OKEAttrPrefix + "/" + "hpcIslandId"
@@ -56,6 +68,13 @@ const (
 var (
 	sysfsPCIDevices    = "/sys/bus/pci/devices"
 	procSysNetIPv4Conf = "/proc/sys/net/ipv4/conf"
+	interfaceAddresses = func(ifName string) ([]net.Addr, error) {
+		iface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			return nil, err
+		}
+		return iface.Addrs()
+	}
 )
 
 // imdsHostRDMATopologyData contains the RDMA topology fields from the OCI
@@ -78,6 +97,7 @@ type imdsHostMetadata struct {
 }
 
 var _ cloudprovider.CloudInstance = (*OKEInstance)(nil)
+var _ cloudprovider.ProfileProvider = (*OKEInstance)(nil)
 
 // OKEInstance holds OCI/OKE specific instance topology data.
 type OKEInstance struct {
@@ -138,8 +158,8 @@ func ocidSuffix(s string) (string, error) {
 	return suffix, nil
 }
 
-// GetDeviceConfig keeps OKE fabric interfaces on the host and applies the
-// parent ARP policy to the ipvlan child.
+// GetDeviceConfig keeps OKE fabric interfaces on the host. It selects the
+// IPv4 child profile and applies the parent ARP policy to the IPvlan child.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
 	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
 	if err != nil || !isFabricInterface(ifName) {
@@ -147,6 +167,7 @@ func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.
 	}
 
 	config := &apis.NetworkConfig{
+		Profile:      okeRDMAIPv4Profile,
 		SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
 	}
 
@@ -167,17 +188,133 @@ func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.
 	return config
 }
 
+// GetProfileConfig derives one IPv4 address for an IPvlan child from the
+// unique OCA address on its RDMA parent.
+func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ types.UID, config *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+	if config == nil {
+		return nil, errors.New("OKE profile configuration is required")
+	}
+	if config.Profile != okeRDMAIPv4Profile {
+		return nil, fmt.Errorf("unsupported OKE profile %q", config.Profile)
+	}
+	if config.SubInterface == nil || config.SubInterface.Type != apis.SubInterfaceTypeIPVlan {
+		return nil, fmt.Errorf("OKE profile %q requires an ipvlan subinterface", config.Profile)
+	}
+
+	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
+	if err != nil {
+		return nil, err
+	}
+	railIndex, err := fabricInterfaceIndex(ifName)
+	if err != nil {
+		return nil, err
+	}
+	if railIndex > okeRDMAMaxRailIndex {
+		return nil, fmt.Errorf("OKE IPv4 profile supports rdma0 through rdma%d, got %q", okeRDMAMaxRailIndex, ifName)
+	}
+
+	parentAddr, err := parentIPv4Address(ifName)
+	if err != nil {
+		return nil, err
+	}
+	childAddr, err := translateIPv4Address(
+		parentAddr,
+		netip.MustParsePrefix(okeRDMAParentIPv4CIDR),
+		netip.MustParsePrefix(okeRDMAChildIPv4CIDR),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not derive OKE child address for %s: %w", ifName, err)
+	}
+
+	childPrefix := netip.PrefixFrom(childAddr, netip.MustParsePrefix(okeRDMAChildIPv4CIDR).Bits())
+	sourcePrefix := netip.PrefixFrom(childAddr, childAddr.BitLen())
+	table := okeRDMASBRTableBase + railIndex
+
+	return &apis.NetworkConfig{
+		SubInterface: &apis.SubInterfaceConfig{
+			Addresses: []string{childPrefix.String()},
+		},
+		Routes: []apis.RouteConfig{{
+			Destination: okeRDMAChildIPv4CIDR,
+			Source:      childAddr.String(),
+			Scope:       253,
+			Table:       table,
+		}},
+		Rules: []apis.RuleConfig{{
+			Priority: 32000,
+			Source:   sourcePrefix.String(),
+			Table:    table,
+		}},
+	}, nil
+}
+
+// ReleaseProfileConfig has no work because the child address is deterministic.
+func (o *OKEInstance) ReleaseProfileConfig(cloudprovider.DeviceIdentifiers, types.UID, *apis.NetworkConfig) error {
+	return nil
+}
+
+func parentIPv4Address(ifName string) (netip.Addr, error) {
+	addresses, err := interfaceAddresses(ifName)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("could not read addresses for %s: %w", ifName, err)
+	}
+	parentRange := netip.MustParsePrefix(okeRDMAParentIPv4CIDR)
+	for _, address := range addresses {
+		prefix, err := netip.ParsePrefix(address.String())
+		if err == nil && prefix.Addr().Is4() && parentRange.Contains(prefix.Addr()) {
+			return prefix.Addr(), nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("interface %s has no IPv4 address in %s", ifName, parentRange)
+}
+
+func translateIPv4Address(address netip.Addr, source, target netip.Prefix) (netip.Addr, error) {
+	if !address.Is4() || !source.Addr().Is4() || !target.Addr().Is4() {
+		return netip.Addr{}, errors.New("address ranges must use IPv4")
+	}
+	if source.Bits() != target.Bits() {
+		return netip.Addr{}, fmt.Errorf("source prefix length %d does not match target prefix length %d", source.Bits(), target.Bits())
+	}
+	source = source.Masked()
+	target = target.Masked()
+	if !source.Contains(address) {
+		return netip.Addr{}, fmt.Errorf("address %s is outside source range %s", address, source)
+	}
+
+	addressBytes := address.As4()
+	sourceBytes := source.Addr().As4()
+	targetBytes := target.Addr().As4()
+	offset := binary.BigEndian.Uint32(addressBytes[:]) - binary.BigEndian.Uint32(sourceBytes[:])
+	value := binary.BigEndian.Uint32(targetBytes[:]) + offset
+	var translatedBytes [4]byte
+	binary.BigEndian.PutUint32(translatedBytes[:], value)
+	translated := netip.AddrFrom4(translatedBytes)
+	if !target.Contains(translated) {
+		return netip.Addr{}, fmt.Errorf("translated address %s is outside target range %s", translated, target)
+	}
+	return translated, nil
+}
+
 func isFabricInterface(ifName string) bool {
+	_, err := fabricInterfaceIndex(ifName)
+	return err == nil
+}
+
+func fabricInterfaceIndex(ifName string) (int, error) {
 	index, ok := strings.CutPrefix(ifName, fabricInterfacePrefix)
 	if !ok || index == "" {
-		return false
+		return 0, fmt.Errorf("network interface %q does not use the rdmaN name format", ifName)
 	}
 	for _, r := range index {
 		if r < '0' || r > '9' {
-			return false
+			return 0, fmt.Errorf("network interface %q does not use the rdmaN name format", ifName)
 		}
 	}
-	return true
+	value, err := strconv.Atoi(index)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse RDMA rail index from %q: %w", ifName, err)
+	}
+	return value, nil
 }
 
 func interfaceNameForPCIAddress(pciAddress string) (string, error) {
