@@ -153,6 +153,13 @@ func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*re
 // container runtime and has strong expectactions to be executed fast (default hook timeout is 2 seconds).
 //
 // TODO(#290): This function has grown too large and needs to be split apart.
+func validateSubInterfaceAddressSource(config *apis.SubInterfaceConfig) error {
+	if len(config.Addresses) > 0 || len(config.IPRanges) > 0 || config.AddressMode == apis.SubInterfaceAddressModeSLAAC {
+		return nil
+	}
+	return errors.New("no IPRanges specified")
+}
+
 func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	klog.V(2).Infof("PrepareResourceClaim Claim %s/%s", claim.Namespace, claim.Name)
 	start := time.Now()
@@ -460,6 +467,11 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			if deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Name == "" {
 				subInterfaceType := deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Type
 				deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Name = string(subInterfaceType) + "-" + ifName
+			}
+
+			if err := validateSubInterfaceAddressSource(deviceCfg.NetworkInterfaceConfigInPod.SubInterface); err != nil {
+				errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s, %w", ifName, err))
+				continue
 			}
 
 			// Allocate from configured ranges when no static address is specified.

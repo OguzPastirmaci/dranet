@@ -209,6 +209,43 @@ func TestMergeNetworkConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "subinterface: cloud SLAAC mode is retained",
+			user: &NetworkConfig{},
+			cloud: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:        SubInterfaceTypeIPVlan,
+					AddressMode: SubInterfaceAddressModeSLAAC,
+				},
+			},
+			want: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:        SubInterfaceTypeIPVlan,
+					AddressMode: SubInterfaceAddressModeSLAAC,
+				},
+			},
+		},
+		{
+			name: "subinterface: user requires an address over cloud SLAAC mode",
+			user: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:        SubInterfaceTypeIPVlan,
+					AddressMode: SubInterfaceAddressModeRequired,
+				},
+			},
+			cloud: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:        SubInterfaceTypeIPVlan,
+					AddressMode: SubInterfaceAddressModeSLAAC,
+				},
+			},
+			want: &NetworkConfig{
+				SubInterface: &SubInterfaceConfig{
+					Type:        SubInterfaceTypeIPVlan,
+					AddressMode: SubInterfaceAddressModeRequired,
+				},
+			},
+		},
+		{
 			name: "subinterface: IPRanges from user and cloud are combined user-first and deduplicated",
 			user: &NetworkConfig{
 				SubInterface: &SubInterfaceConfig{

@@ -44,9 +44,12 @@ import (
 const (
 	OKEAttrPrefix = "oke.dra.net"
 
-	fabricInterfacePrefix = "rdma"
-	okeRDMAIPv4Profile    = "oke-rdma-ipv4"
-	okeRDMASBRTableBase   = 100
+	fabricInterfacePrefix     = "rdma"
+	okeRDMAIPv4Profile        = "oke-rdma-ipv4"
+	okeRDMASBRTableBase       = 100
+	okeRDMARailPrefixBits     = 19
+	arpHardwareTypeEthernet   = 1
+	arpHardwareTypeInfiniBand = 32
 
 	// OCA assigns B4 RDMA parent addresses from this /15. DRANET uses a
 	// separate /15 for one deterministic IPvlan child per parent.
@@ -134,12 +137,13 @@ var _ cloudprovider.ProfileProvider = (*OKEInstance)(nil)
 
 // OKEInstance holds OCI/OKE specific instance topology data.
 type OKEInstance struct {
-	metadata         atomic.Pointer[okeMetadata]
-	fetchMetadata    metadataFetcher
-	retryInterval    time.Duration
-	maxRetryInterval time.Duration
-	refreshInterval  time.Duration
-	requestTimeout   time.Duration
+	metadata           atomic.Pointer[okeMetadata]
+	fetchMetadata      metadataFetcher
+	requiresFabricData bool
+	retryInterval      time.Duration
+	maxRetryInterval   time.Duration
+	refreshInterval    time.Duration
+	requestTimeout     time.Duration
 }
 
 func newOKEInstance(metadata *okeMetadata, fetch metadataFetcher) *OKEInstance {
@@ -223,6 +227,18 @@ func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.
 		Profile:      okeRDMAIPv4Profile,
 		SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
 	}
+	hardwareType, err := interfaceHardwareType(ifName)
+	if err != nil {
+		klog.Warningf("Could not read OKE interface type for device %s: %v", id.Name, err)
+		return config
+	}
+	if hardwareType == arpHardwareTypeInfiniBand {
+		return nil
+	}
+	if hardwareType != arpHardwareTypeEthernet {
+		klog.Warningf("OKE interface %s for device %s has unsupported ARPHRD type %d", ifName, id.Name, hardwareType)
+		return config
+	}
 	metadata := o.metadata.Load()
 	if metadata == nil || metadata.RDMAFabric == nil {
 		klog.Warningf("OKE RDMA fabric data is not available for device %s", id.Name)
@@ -230,6 +246,7 @@ func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.
 	}
 	if metadata.RDMAFabric.IPv6 {
 		config.Profile = ""
+		config.SubInterface.AddressMode = apis.SubInterfaceAddressModeSLAAC
 		return config
 	}
 
@@ -274,6 +291,13 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ typ
 	if err != nil {
 		return nil, err
 	}
+	hardwareType, err := interfaceHardwareType(ifName)
+	if err != nil {
+		return nil, err
+	}
+	if hardwareType != arpHardwareTypeEthernet {
+		return nil, fmt.Errorf("OKE profile %q requires an Ethernet parent, but %s has ARPHRD type %d", config.Profile, ifName, hardwareType)
+	}
 	railIndex, err := fabricInterfaceIndex(ifName)
 	if err != nil {
 		return nil, err
@@ -282,6 +306,9 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ typ
 	parentAddr, err := parentIPv4Address(ifName)
 	if err != nil {
 		return nil, err
+	}
+	if err := validateClassicRailLayout(parentAddr, railIndex); err != nil {
+		return nil, fmt.Errorf("could not derive OKE child address for %s: %w", ifName, err)
 	}
 	childAddr, err := translateIPv4Address(
 		parentAddr,
@@ -316,6 +343,23 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ typ
 
 // ReleaseProfileConfig has no work because the child address is deterministic.
 func (o *OKEInstance) ReleaseProfileConfig(cloudprovider.DeviceIdentifiers, types.UID, *apis.NetworkConfig) error {
+	return nil
+}
+
+func validateClassicRailLayout(address netip.Addr, railIndex int) error {
+	parentRange := netip.MustParsePrefix(okeRDMAParentIPv4CIDR).Masked()
+	if !address.Is4() || !parentRange.Contains(address) {
+		return fmt.Errorf("address %s is outside classic OCA range %s", address, parentRange)
+	}
+
+	addressBytes := address.As4()
+	baseBytes := parentRange.Addr().As4()
+	offset := binary.BigEndian.Uint32(addressBytes[:]) - binary.BigEndian.Uint32(baseBytes[:])
+	railBlockSize := uint32(1 << (32 - okeRDMARailPrefixBits))
+	addressRailIndex := int(offset / railBlockSize)
+	if addressRailIndex != railIndex {
+		return fmt.Errorf("address %s belongs to classic OCA rail %d, not rail %d", address, addressRailIndex, railIndex)
+	}
 	return nil
 }
 
@@ -408,6 +452,19 @@ func interfaceNameForPCIAddress(pciAddress string) (string, error) {
 		return "", fmt.Errorf("expected one network interface for PCI device %s, got %d", pciAddress, len(entries))
 	}
 	return entries[0].Name(), nil
+}
+
+func interfaceHardwareType(ifName string) (int, error) {
+	name := filepath.Join(sysClassNet, ifName, "type")
+	data, err := os.ReadFile(name)
+	if err != nil {
+		return 0, fmt.Errorf("could not read %s: %w", name, err)
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("could not parse %s: %w", name, err)
+	}
+	return value, nil
 }
 
 func readARPSysctl(ifName, setting string) (*int32, error) {
@@ -515,12 +572,7 @@ func parseRDMAFabricData(data *imdsRDMAFabricData) (*RDMAFabric, error) {
 	return &RDMAFabric{IPv6: *data.IPv6, Planes: *data.Planes}, nil
 }
 
-func metadataFromIMDS(host *imdsHostMetadata, fabricData *imdsRDMAFabricData) (*okeMetadata, error) {
-	fabric, err := parseRDMAFabricData(fabricData)
-	if err != nil {
-		return nil, err
-	}
-
+func metadataFromIMDS(host *imdsHostMetadata, fabric *RDMAFabric) (*okeMetadata, error) {
 	metadata := &okeMetadata{
 		NetworkBlockId: host.NetworkBlockId,
 		RackId:         host.RackId,
@@ -531,6 +583,7 @@ func metadataFromIMDS(host *imdsHostMetadata, fabricData *imdsRDMAFabricData) (*
 		return metadata, nil
 	}
 
+	var err error
 	metadata.HPCIslandId, err = ocidSuffix(topo.CustomerHPCIslandId)
 	if err != nil {
 		return nil, fmt.Errorf("invalid HPCIslandId: %w", err)
@@ -550,23 +603,38 @@ func metadataFromIMDS(host *imdsHostMetadata, fabricData *imdsRDMAFabricData) (*
 	return metadata, nil
 }
 
-func fetchOKEMetadata(ctx context.Context, client *http.Client, endpoint string) (*okeMetadata, error) {
+func getRDMAFabricData(ctx context.Context, client *http.Client, endpoint string, host *imdsHostMetadata, required bool) *RDMAFabric {
+	if required {
+		direct, err := queryRDMAFabricData(ctx, client, endpoint+"/host/rdmaFabricData/")
+		if err == nil {
+			fabric, parseErr := parseRDMAFabricData(direct)
+			if parseErr == nil && fabric != nil {
+				return fabric
+			}
+			if parseErr != nil {
+				klog.Warningf("Could not use OCI IMDS RDMA fabric endpoint: %v", parseErr)
+			}
+		} else {
+			klog.Warningf("Could not query OCI IMDS RDMA fabric endpoint: %v", err)
+		}
+	}
+
+	fabric, err := parseRDMAFabricData(host.RDMAFabricData)
+	if err != nil {
+		klog.Warningf("Could not use RDMA fabric data from OCI IMDS host metadata: %v", err)
+		return nil
+	}
+	return fabric
+}
+
+func fetchOKEMetadata(ctx context.Context, client *http.Client, endpoint string, requiresFabricData bool) (*okeMetadata, error) {
 	host, err := queryHostMetadata(ctx, client, endpoint+"/host/")
 	if err != nil {
 		return nil, err
 	}
 
-	fabricData := host.RDMAFabricData
-	if hasFabricInterface() {
-		fabricData, err = queryRDMAFabricData(ctx, client, endpoint+"/host/rdmaFabricData/")
-		if err != nil {
-			return nil, err
-		}
-		if fabricData == nil {
-			return nil, errors.New("OCI IMDS RDMA fabric response is empty")
-		}
-	}
-	return metadataFromIMDS(host, fabricData)
+	fabric := getRDMAFabricData(ctx, client, endpoint, host, requiresFabricData)
+	return metadataFromIMDS(host, fabric)
 }
 
 func mergeMetadata(current, next *okeMetadata) (*okeMetadata, bool) {
@@ -626,8 +694,13 @@ func (o *OKEInstance) refreshMetadata(ctx context.Context) error {
 	return nil
 }
 
+func (o *OKEInstance) metadataComplete() bool {
+	metadata := o.metadata.Load()
+	return metadata != nil && (!o.requiresFabricData || metadata.RDMAFabric != nil)
+}
+
 func (o *OKEInstance) refreshLoop(ctx context.Context) {
-	retrying := o.metadata.Load() == nil
+	retrying := !o.metadataComplete()
 	retryInterval := o.retryInterval
 	for {
 		interval := o.refreshInterval
@@ -650,6 +723,8 @@ func (o *OKEInstance) refreshLoop(ctx context.Context) {
 		cancel()
 		if err != nil {
 			klog.Warningf("Could not refresh OCI IMDS metadata; keeping the last known values: %v", err)
+		}
+		if err != nil || !o.metadataComplete() {
 			retrying = true
 			retryInterval *= 2
 			if retryInterval > o.maxRetryInterval {
@@ -662,17 +737,21 @@ func (o *OKEInstance) refreshLoop(ctx context.Context) {
 	}
 }
 
-// GetInstance retrieves OCI instance topology by querying the IMDS host endpoint.
-// On shapes with RDMA topology data (GB200, GB300), all five topology attributes
-// are populated. On shapes without it (H100, etc.), only NetworkBlockId and
-// RackId are available from the host metadata.
+// GetInstance reads OKE topology and RDMA fabric metadata from OCI IMDS.
+// It refreshes the metadata and keeps the last complete fabric data.
 func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
+	requiresFabricData := hasFabricInterface()
 	instance := newOKEInstance(nil, func(ctx context.Context) (*okeMetadata, error) {
-		return fetchOKEMetadata(ctx, http.DefaultClient, imdsEndpoint)
+		return fetchOKEMetadata(ctx, http.DefaultClient, imdsEndpoint, requiresFabricData)
 	})
+	instance.requiresFabricData = requiresFabricData
 	err := wait.PollUntilContextTimeout(ctx, imdsInitialRetryInterval, imdsInitialWait, true, func(ctx context.Context) (bool, error) {
 		if err := instance.refreshMetadata(ctx); err != nil {
 			klog.Infof("Could not get complete OCI IMDS metadata; retrying: %v", err)
+			return false, nil
+		}
+		if !instance.metadataComplete() {
+			klog.Infof("OCI IMDS RDMA fabric data is incomplete; retrying")
 			return false, nil
 		}
 		return true, nil

@@ -15,6 +15,9 @@ type NetworkConfig struct {
 	// Settings here are typically managed by `ip link` commands.
 	Interface InterfaceConfig `json:"interface"`
 
+	// SubInterface defines a virtual interface that DRANET creates in the pod.
+	SubInterface *SubInterfaceConfig `json:"subInterface,omitempty"`
+
 	// Routes defines static routes to be configured for this interface.
 	Routes []RouteConfig `json:"routes,omitempty"`
 
@@ -104,6 +107,17 @@ for both settings. A per-interface setting cannot reduce the effective value bel
 `conf/all`. New IPv4 network namespaces normally inherit `conf/all` and `conf/default`
 from the initial network namespace, subject to `net.core.devconf_inherit_init_net`.
 DRANET only changes the per-interface value.
+
+#### Subinterface Address Configuration
+
+A subinterface normally needs an entry in `addresses` or `ipRanges`. DRANET rejects the claim if neither field contains a value.
+
+The optional `addressMode` field changes this rule:
+
+* An empty value or `required` requires `addresses` or `ipRanges`.
+* `slaac` lets DRANET create the subinterface without an address. IPv6 router advertisements then configure the address.
+
+Use `slaac` only on a network that provides IPv6 router advertisements. The OKE provider selects this mode for an IPv6 RDMA fabric.
 
 #### Route Configuration (RouteConfig)
 

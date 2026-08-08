@@ -26,6 +26,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -262,66 +264,103 @@ func TestParseRDMAFabricDataRequiresAllFields(t *testing.T) {
 	}
 }
 
-func TestFetchOKEMetadataUsesDirectFabricEndpoint(t *testing.T) {
-	originalSysClassNet := sysClassNet
-	sysClassNet = t.TempDir()
-	t.Cleanup(func() { sysClassNet = originalSysClassNet })
-	if err := os.Mkdir(filepath.Join(sysClassNet, "rdma0"), 0o755); err != nil {
-		t.Fatalf("Mkdir() returned error: %v", err)
+func TestFetchOKEMetadataFabricFallback(t *testing.T) {
+	tests := []struct {
+		name               string
+		hostResponse       string
+		directResponse     string
+		directStatus       int
+		requiresFabricData bool
+		wantFabric         *RDMAFabric
+		wantDirectRequest  bool
+	}{
+		{
+			name:               "direct endpoint is preferred",
+			hostResponse:       `{"networkBlockId":"network-1","rackId":"rack-1","rdmaFabricData":{"ipv6":true,"planes":8}}`,
+			directResponse:     `{"ipv6":false,"planes":0}`,
+			directStatus:       http.StatusOK,
+			requiresFabricData: true,
+			wantFabric:         &RDMAFabric{IPv6: false, Planes: 0},
+			wantDirectRequest:  true,
+		},
+		{
+			name:               "embedded data is used when direct endpoint is absent",
+			hostResponse:       `{"networkBlockId":"network-1","rackId":"rack-1","rdmaFabricData":{"ipv6":false,"planes":4}}`,
+			directStatus:       http.StatusNotFound,
+			requiresFabricData: true,
+			wantFabric:         &RDMAFabric{IPv6: false, Planes: 4},
+			wantDirectRequest:  true,
+		},
+		{
+			name:               "topology is kept when direct and embedded data are absent",
+			hostResponse:       `{"networkBlockId":"network-1","rackId":"rack-1"}`,
+			directStatus:       http.StatusNotFound,
+			requiresFabricData: true,
+			wantDirectRequest:  true,
+		},
+		{
+			name:               "embedded data is used when direct data is incomplete",
+			hostResponse:       `{"networkBlockId":"network-1","rackId":"rack-1","rdmaFabricData":{"ipv6":true,"planes":8}}`,
+			directResponse:     `{"ipv6":false}`,
+			directStatus:       http.StatusOK,
+			requiresFabricData: true,
+			wantFabric:         &RDMAFabric{IPv6: true, Planes: 8},
+			wantDirectRequest:  true,
+		},
+		{
+			name:               "topology is kept when both fabric responses are incomplete",
+			hostResponse:       `{"networkBlockId":"network-1","rackId":"rack-1","rdmaFabricData":{"ipv6":false}}`,
+			directResponse:     `{"planes":8}`,
+			directStatus:       http.StatusOK,
+			requiresFabricData: true,
+			wantDirectRequest:  true,
+		},
+		{
+			name:           "non-fabric node uses embedded data",
+			hostResponse:   `{"networkBlockId":"network-1","rackId":"rack-1","rdmaFabricData":{"ipv6":true,"planes":2}}`,
+			directResponse: `{"ipv6":false,"planes":0}`,
+			directStatus:   http.StatusOK,
+			wantFabric:     &RDMAFabric{IPv6: true, Planes: 2},
+		},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer Oracle" {
-			http.Error(w, "missing authorization", http.StatusUnauthorized)
-			return
-		}
-		switch r.URL.Path {
-		case "/host/":
-			_, _ = w.Write([]byte(`{"networkBlockId":"network-1","rackId":"rack-1"}`))
-		case "/host/rdmaFabricData/":
-			_, _ = w.Write([]byte(`{"ipv6":false,"planes":0}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var directRequested atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer Oracle" {
+					http.Error(w, "missing authorization", http.StatusUnauthorized)
+					return
+				}
+				switch r.URL.Path {
+				case "/host/":
+					_, _ = w.Write([]byte(tt.hostResponse))
+				case "/host/rdmaFabricData/":
+					directRequested.Store(true)
+					w.WriteHeader(tt.directStatus)
+					_, _ = w.Write([]byte(tt.directResponse))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
 
-	got, err := fetchOKEMetadata(context.Background(), server.Client(), server.URL)
-	if err != nil {
-		t.Fatalf("fetchOKEMetadata() returned error: %v", err)
-	}
-	want := &okeMetadata{
-		NetworkBlockId: "network-1",
-		RackId:         "rack-1",
-		RDMAFabric:     &RDMAFabric{IPv6: false, Planes: 0},
-	}
-	if diff := cmp.Diff(want, got); diff != "" {
-		t.Errorf("fetchOKEMetadata() mismatch (-want +got):\n%s", diff)
-	}
-}
-
-func TestFetchOKEMetadataRejectsPartialFabricData(t *testing.T) {
-	originalSysClassNet := sysClassNet
-	sysClassNet = t.TempDir()
-	t.Cleanup(func() { sysClassNet = originalSysClassNet })
-	if err := os.Mkdir(filepath.Join(sysClassNet, "rdma0"), 0o755); err != nil {
-		t.Fatalf("Mkdir() returned error: %v", err)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/host/":
-			_, _ = w.Write([]byte(`{"networkBlockId":"network-1"}`))
-		case "/host/rdmaFabricData/":
-			_, _ = w.Write([]byte(`{"ipv6":false}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	if _, err := fetchOKEMetadata(context.Background(), server.Client(), server.URL); err == nil {
-		t.Fatal("fetchOKEMetadata() returned no error for partial RDMA fabric data")
+			got, err := fetchOKEMetadata(context.Background(), server.Client(), server.URL, tt.requiresFabricData)
+			if err != nil {
+				t.Fatalf("fetchOKEMetadata() returned error: %v", err)
+			}
+			want := &okeMetadata{
+				NetworkBlockId: "network-1",
+				RackId:         "rack-1",
+				RDMAFabric:     tt.wantFabric,
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("fetchOKEMetadata() mismatch (-want +got):\n%s", diff)
+			}
+			if directRequested.Load() != tt.wantDirectRequest {
+				t.Errorf("direct endpoint requested = %v, want %v", directRequested.Load(), tt.wantDirectRequest)
+			}
+		})
 	}
 }
 
@@ -368,17 +407,18 @@ func TestRefreshMetadataKeepsLastKnownDataOnFailure(t *testing.T) {
 	}
 }
 
-func TestRefreshLoopRecoversAfterStartupFailure(t *testing.T) {
+func TestRefreshLoopRetriesIncompleteFabricData(t *testing.T) {
 	attempts := make(chan int, 2)
 	attempt := 0
 	instance := newOKEInstance(nil, func(context.Context) (*okeMetadata, error) {
 		attempt++
 		attempts <- attempt
 		if attempt == 1 {
-			return nil, errors.New("IMDS is not ready")
+			return &okeMetadata{NetworkBlockId: "network-1"}, nil
 		}
 		return &okeMetadata{RDMAFabric: &RDMAFabric{IPv6: true, Planes: 8}}, nil
 	})
+	instance.requiresFabricData = true
 	instance.retryInterval = time.Millisecond
 	instance.maxRetryInterval = 2 * time.Millisecond
 	instance.refreshInterval = time.Hour
@@ -403,7 +443,7 @@ func TestRefreshLoopRecoversAfterStartupFailure(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	got := instance.metadata.Load()
-	if got == nil || got.RDMAFabric == nil || !got.RDMAFabric.IPv6 || got.RDMAFabric.Planes != 8 {
+	if got == nil || got.NetworkBlockId != "network-1" || got.RDMAFabric == nil || !got.RDMAFabric.IPv6 || got.RDMAFabric.Planes != 8 {
 		t.Fatalf("refreshLoop() stored %#v, want IPv6 with 8 planes", got)
 	}
 }
@@ -486,18 +526,27 @@ func TestOCIDSuffix(t *testing.T) {
 
 func TestGetDeviceConfig(t *testing.T) {
 	originalSysfs := sysfsPCIDevices
+	originalSysClassNet := sysClassNet
 	originalProc := procSysNetIPv4Conf
 	sysfsPCIDevices = t.TempDir()
+	sysClassNet = t.TempDir()
 	procSysNetIPv4Conf = t.TempDir()
 	t.Cleanup(func() {
 		sysfsPCIDevices = originalSysfs
+		sysClassNet = originalSysClassNet
 		procSysNetIPv4Conf = originalProc
 	})
 
-	addDevice := func(pciAddress, ifName string, arpIgnore, arpAnnounce *string) {
+	addDevice := func(pciAddress, ifName, hardwareType string, arpIgnore, arpAnnounce *string) {
 		t.Helper()
 		if err := os.MkdirAll(filepath.Join(sysfsPCIDevices, pciAddress, "net", ifName), 0o755); err != nil {
 			t.Fatalf("failed to create fake sysfs: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(sysClassNet, ifName), 0o755); err != nil {
+			t.Fatalf("failed to create fake network class: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(sysClassNet, ifName, "type"), []byte(hardwareType), 0o644); err != nil {
+			t.Fatalf("failed to write fake interface type: %v", err)
 		}
 		if err := os.MkdirAll(filepath.Join(procSysNetIPv4Conf, ifName), 0o755); err != nil {
 			t.Fatalf("failed to create fake proc sys: %v", err)
@@ -515,9 +564,12 @@ func TestGetDeviceConfig(t *testing.T) {
 	one := "1"
 	two := "2"
 	four := "4"
-	addDevice("0000:0c:00.0", "rdma0", &one, &two)
-	addDevice("0000:0d:00.0", "eth0", &one, &two)
-	addDevice("0000:0e:00.0", "rdma1", &four, &two)
+	addDevice("0000:0c:00.0", "rdma0", "1\n", &one, &two)
+	addDevice("0000:0d:00.0", "eth0", "1\n", &one, &two)
+	addDevice("0000:0e:00.0", "rdma1", "1\n", &four, &two)
+	addDevice("0000:12:00.0", "rdma3", "32\n", nil, nil)
+	addDevice("0000:13:00.0", "rdma4", "invalid\n", nil, nil)
+	addDevice("0000:14:00.0", "rdma5", "772\n", nil, nil)
 	ipv4Instance := newOKEInstance(&okeMetadata{RDMAFabric: &RDMAFabric{IPv6: false, Planes: 0}}, nil)
 
 	tests := []struct {
@@ -543,7 +595,10 @@ func TestGetDeviceConfig(t *testing.T) {
 			name:     "IPv6 fabric uses address-free ipvlan",
 			instance: newOKEInstance(&okeMetadata{RDMAFabric: &RDMAFabric{IPv6: true, Planes: 8}}, nil),
 			id:       cloudprovider.DeviceIdentifiers{Name: "pci-0000-0c-00-0", PCIAddress: "0000:0c:00.0"},
-			want:     &apis.NetworkConfig{SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan}},
+			want: &apis.NetworkConfig{SubInterface: &apis.SubInterfaceConfig{
+				Type:        apis.SubInterfaceTypeIPVlan,
+				AddressMode: apis.SubInterfaceAddressModeSLAAC,
+			}},
 		},
 		{
 			name:     "missing fabric data keeps a failing profile",
@@ -557,6 +612,26 @@ func TestGetDeviceConfig(t *testing.T) {
 		{
 			name: "non-fabric interface",
 			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-0d-00-0", PCIAddress: "0000:0d:00.0"},
+		},
+		{
+			name: "native InfiniBand interface uses direct move",
+			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-12-00-0", PCIAddress: "0000:12:00.0"},
+		},
+		{
+			name: "invalid interface type keeps failing profile",
+			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-13-00-0", PCIAddress: "0000:13:00.0"},
+			want: &apis.NetworkConfig{
+				Profile:      okeRDMAIPv4Profile,
+				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
+			},
+		},
+		{
+			name: "unsupported interface type keeps failing profile",
+			id:   cloudprovider.DeviceIdentifiers{Name: "pci-0000-14-00-0", PCIAddress: "0000:14:00.0"},
+			want: &apis.NetworkConfig{
+				Profile:      okeRDMAIPv4Profile,
+				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
+			},
 		},
 		{
 			name: "missing PCI address",
@@ -590,24 +665,35 @@ func TestGetDeviceConfig(t *testing.T) {
 
 func TestGetProfileConfig(t *testing.T) {
 	originalSysfs := sysfsPCIDevices
+	originalSysClassNet := sysClassNet
 	originalInterfaceAddresses := interfaceAddresses
 	sysfsPCIDevices = t.TempDir()
+	sysClassNet = t.TempDir()
 	t.Cleanup(func() {
 		sysfsPCIDevices = originalSysfs
+		sysClassNet = originalSysClassNet
 		interfaceAddresses = originalInterfaceAddresses
 	})
 
-	addDevice := func(pciAddress, ifName string) {
+	addDevice := func(pciAddress, ifName, hardwareType string) {
 		t.Helper()
 		if err := os.MkdirAll(filepath.Join(sysfsPCIDevices, pciAddress, "net", ifName), 0o755); err != nil {
 			t.Fatalf("failed to create fake sysfs: %v", err)
 		}
+		if err := os.MkdirAll(filepath.Join(sysClassNet, ifName), 0o755); err != nil {
+			t.Fatalf("failed to create fake network class: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(sysClassNet, ifName, "type"), []byte(hardwareType), 0o644); err != nil {
+			t.Fatalf("failed to write fake interface type: %v", err)
+		}
 	}
-	addDevice("0000:0c:00.0", "rdma0")
-	addDevice("0000:0d:00.0", "rdma15")
-	addDevice("0000:0e:00.0", "rdma16")
-	addDevice("0000:0f:00.0", "eth0")
-	addDevice("0000:10:00.0", "rdma1")
+	addDevice("0000:0c:00.0", "rdma0", "1\n")
+	addDevice("0000:0d:00.0", "rdma15", "1\n")
+	addDevice("0000:0e:00.0", "rdma16", "1\n")
+	addDevice("0000:0f:00.0", "eth0", "1\n")
+	addDevice("0000:10:00.0", "rdma1", "1\n")
+	addDevice("0000:11:00.0", "rdma2", "1\n")
+	addDevice("0000:12:00.0", "rdma3", "32\n")
 
 	interfaceAddresses = func(ifName string) ([]net.Addr, error) {
 		addresses := map[string]string{
@@ -616,6 +702,7 @@ func TestGetProfileConfig(t *testing.T) {
 			"rdma16": "10.225.250.100/12",
 			"eth0":   "10.140.70.100/19",
 			"rdma1":  "10.226.6.100/12",
+			"rdma2":  "10.224.6.101/12",
 		}
 		cidr, ok := addresses[ifName]
 		if !ok {
@@ -635,12 +722,13 @@ func TestGetProfileConfig(t *testing.T) {
 	}
 	ipv4Instance := newOKEInstance(&okeMetadata{RDMAFabric: &RDMAFabric{IPv6: false, Planes: 0}}, nil)
 	tests := []struct {
-		name     string
-		instance *OKEInstance
-		id       cloudprovider.DeviceIdentifiers
-		config   *apis.NetworkConfig
-		want     *apis.NetworkConfig
-		wantErr  bool
+		name            string
+		instance        *OKEInstance
+		id              cloudprovider.DeviceIdentifiers
+		config          *apis.NetworkConfig
+		want            *apis.NetworkConfig
+		wantErr         bool
+		wantErrContains string
 	}{
 		{
 			name:   "first rail",
@@ -699,19 +787,10 @@ func TestGetProfileConfig(t *testing.T) {
 			wantErr:  true,
 		},
 		{
-			name:   "rail index above tested B4 count",
-			id:     cloudprovider.DeviceIdentifiers{Name: "pci-0000-0e-00-0", PCIAddress: "0000:0e:00.0"},
-			config: baseConfig,
-			want: &apis.NetworkConfig{
-				SubInterface: &apis.SubInterfaceConfig{Addresses: []string{"10.241.250.100/15"}},
-				Routes: []apis.RouteConfig{{
-					Destination: "10.240.0.0/15",
-					Source:      "10.241.250.100",
-					Scope:       253,
-					Table:       116,
-				}},
-				Rules: []apis.RuleConfig{{Priority: 32000, Source: "10.241.250.100/32", Table: 116}},
-			},
+			name:    "rail index above tested B4 count",
+			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-0e-00-0", PCIAddress: "0000:0e:00.0"},
+			config:  baseConfig,
+			wantErr: true,
 		},
 		{
 			name:    "non-fabric interface",
@@ -724,6 +803,19 @@ func TestGetProfileConfig(t *testing.T) {
 			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-10-00-0", PCIAddress: "0000:10:00.0"},
 			config:  baseConfig,
 			wantErr: true,
+		},
+		{
+			name:    "parent address belongs to another rail",
+			id:      cloudprovider.DeviceIdentifiers{Name: "pci-0000-11-00-0", PCIAddress: "0000:11:00.0"},
+			config:  baseConfig,
+			wantErr: true,
+		},
+		{
+			name:            "native InfiniBand parent rejects ipvlan profile",
+			id:              cloudprovider.DeviceIdentifiers{Name: "pci-0000-12-00-0", PCIAddress: "0000:12:00.0"},
+			config:          baseConfig,
+			wantErr:         true,
+			wantErrContains: "rdma3 has ARPHRD type 32",
 		},
 	}
 
@@ -738,6 +830,9 @@ func TestGetProfileConfig(t *testing.T) {
 				if err == nil {
 					t.Fatalf("GetProfileConfig() returned no error, got %#v", got)
 				}
+				if tt.wantErrContains != "" && !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Fatalf("GetProfileConfig() error = %q, want it to contain %q", err, tt.wantErrContains)
+				}
 				return
 			}
 			if err != nil {
@@ -745,6 +840,30 @@ func TestGetProfileConfig(t *testing.T) {
 			}
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("GetProfileConfig() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestValidateClassicRailLayout(t *testing.T) {
+	tests := []struct {
+		name      string
+		address   string
+		railIndex int
+		wantErr   bool
+	}{
+		{name: "first rail", address: "10.224.6.100", railIndex: 0},
+		{name: "last rail", address: "10.225.230.100", railIndex: 15},
+		{name: "wrong rail", address: "10.224.6.100", railIndex: 1, wantErr: true},
+		{name: "rail above classic range", address: "10.225.250.100", railIndex: 16, wantErr: true},
+		{name: "address outside classic range", address: "10.226.6.100", railIndex: 0, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateClassicRailLayout(netip.MustParseAddr(tt.address), tt.railIndex)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateClassicRailLayout() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

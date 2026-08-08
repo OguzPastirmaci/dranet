@@ -263,6 +263,12 @@ func validateSubInterfaceConfig(cfg *SubInterfaceConfig, fieldPath string) (allE
 		}
 	}
 
+	if cfg.AddressMode != "" &&
+		cfg.AddressMode != SubInterfaceAddressModeRequired &&
+		cfg.AddressMode != SubInterfaceAddressModeSLAAC {
+		allErrors = append(allErrors, fmt.Errorf("%s.addressMode: '%s' is not supported", fieldPath, cfg.AddressMode))
+	}
+
 	if cfg.Type == SubInterfaceTypeIPVlan {
 		if cfg.IPVlan != nil {
 			allErrors = append(allErrors, validateIPVlanConfig(cfg.IPVlan, fieldPath+".ipvlan")...)

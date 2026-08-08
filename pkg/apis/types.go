@@ -153,6 +153,10 @@ type SubInterfaceConfig struct {
 	// generated per IP family present in the list.
 	IPRanges []IPRangeConfig `json:"ipRanges,omitempty"`
 
+	// AddressMode controls how the subinterface gets an address. The default
+	// requires Addresses or IPRanges. Use "slaac" for address-free creation.
+	AddressMode SubInterfaceAddressMode `json:"addressMode,omitempty"`
+
 	// IPVlan holds IPVLAN-specific settings (mode and flag); it applies only
 	// when Type is "ipvlan".
 	IPVlan *IPVlanConfig `json:"ipvlan,omitempty"`
@@ -188,6 +192,14 @@ type SubInterfaceType string
 
 const (
 	SubInterfaceTypeIPVlan SubInterfaceType = "ipvlan"
+)
+
+// SubInterfaceAddressMode specifies how a subinterface gets an IP address.
+type SubInterfaceAddressMode string
+
+const (
+	SubInterfaceAddressModeRequired SubInterfaceAddressMode = "required"
+	SubInterfaceAddressModeSLAAC    SubInterfaceAddressMode = "slaac"
 )
 
 // IPVlanConfig holds the mode and flag of an IPVLAN subinterface.

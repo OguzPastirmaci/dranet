@@ -437,7 +437,13 @@ func TestValidateSubInterfaceConfig(t *testing.T) {
 	}{
 		{
 			name:      "valid subinterface config",
-			cfg:       &SubInterfaceConfig{Type: "ipvlan", IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}, {StartIP: "10.24.4.10", EndIP: "10.24.4.20"}}, IPVlan: &IPVlanConfig{Mode: "l2", Flag: "bridge"}},
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", IPRanges: []IPRangeConfig{{CIDR: "10.24.3.0/24"}, {StartIP: "10.24.4.10", EndIP: "10.24.4.20"}}, AddressMode: SubInterfaceAddressModeRequired, IPVlan: &IPVlanConfig{Mode: "l2", Flag: "bridge"}},
+			fieldPath: "subInterface",
+			expectErr: false,
+		},
+		{
+			name:      "valid SLAAC address mode",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", AddressMode: SubInterfaceAddressModeSLAAC},
 			fieldPath: "subInterface",
 			expectErr: false,
 		},
@@ -467,6 +473,13 @@ func TestValidateSubInterfaceConfig(t *testing.T) {
 			fieldPath: "subInterface",
 			expectErr: true,
 			errCount:  2,
+		},
+		{
+			name:      "unsupported address mode",
+			cfg:       &SubInterfaceConfig{Type: "ipvlan", AddressMode: "dhcp"},
+			fieldPath: "subInterface",
+			expectErr: true,
+			errCount:  1,
 		},
 	}
 	for _, tt := range tests {

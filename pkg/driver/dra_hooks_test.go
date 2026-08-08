@@ -1096,3 +1096,46 @@ func TestAddSourceBasedRoutingRule(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateSubInterfaceAddressSource(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  *apis.SubInterfaceConfig
+		wantErr bool
+	}{
+		{
+			name:    "default mode requires an address source",
+			config:  &apis.SubInterfaceConfig{},
+			wantErr: true,
+		},
+		{
+			name: "required mode accepts a static address",
+			config: &apis.SubInterfaceConfig{
+				AddressMode: apis.SubInterfaceAddressModeRequired,
+				Addresses:   []string{"192.0.2.10/24"},
+			},
+		},
+		{
+			name: "required mode accepts an IP range",
+			config: &apis.SubInterfaceConfig{
+				AddressMode: apis.SubInterfaceAddressModeRequired,
+				IPRanges:    []apis.IPRangeConfig{{CIDR: "192.0.2.0/24"}},
+			},
+		},
+		{
+			name: "SLAAC mode accepts no address source",
+			config: &apis.SubInterfaceConfig{
+				AddressMode: apis.SubInterfaceAddressModeSLAAC,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSubInterfaceAddressSource(tt.config)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateSubInterfaceAddressSource() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
