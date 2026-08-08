@@ -418,7 +418,7 @@ func TestRefreshLoopRetriesIncompleteFabricData(t *testing.T) {
 		}
 		return &okeMetadata{RDMAFabric: &RDMAFabric{IPv6: true, Planes: 8}}, nil
 	})
-	instance.requiresFabricData = true
+	instance.requiresFabricData.Store(true)
 	instance.retryInterval = time.Millisecond
 	instance.maxRetryInterval = 2 * time.Millisecond
 	instance.refreshInterval = time.Hour
@@ -448,7 +448,40 @@ func TestRefreshLoopRetriesIncompleteFabricData(t *testing.T) {
 	}
 }
 
-func TestHasFabricInterface(t *testing.T) {
+func TestRefreshLoopWakesForLateFabricData(t *testing.T) {
+	attempted := make(chan bool, 1)
+	var instance *OKEInstance
+	instance = newOKEInstance(&okeMetadata{NetworkBlockId: "network-1"}, func(context.Context) (*okeMetadata, error) {
+		attempted <- instance.requiresFabricData.Load()
+		return &okeMetadata{RDMAFabric: &RDMAFabric{IPv6: false, Planes: 0}}, nil
+	})
+	instance.refreshInterval = time.Hour
+	instance.requestTimeout = time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go instance.refreshLoop(ctx)
+
+	instance.requireFabricData()
+	select {
+	case required := <-attempted:
+		if !required {
+			t.Fatal("refreshLoop() fetched metadata without requiring fabric data")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refreshLoop() did not wake for a late fabric interface")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for !instance.metadataComplete() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !instance.metadataComplete() {
+		t.Fatal("refreshLoop() did not store complete fabric data")
+	}
+}
+
+func TestHasEthernetFabricInterface(t *testing.T) {
 	originalSysClassNet := sysClassNet
 	sysClassNet = t.TempDir()
 	t.Cleanup(func() { sysClassNet = originalSysClassNet })
@@ -456,14 +489,26 @@ func TestHasFabricInterface(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(sysClassNet, "eth0"), 0o755); err != nil {
 		t.Fatalf("Mkdir() returned error: %v", err)
 	}
-	if hasFabricInterface() {
-		t.Fatal("hasFabricInterface() = true without an rdmaN interface")
+	if hasEthernetFabricInterface() {
+		t.Fatal("hasEthernetFabricInterface() = true without an rdmaN interface")
 	}
 	if err := os.Mkdir(filepath.Join(sysClassNet, "rdma3"), 0o755); err != nil {
 		t.Fatalf("Mkdir() returned error: %v", err)
 	}
-	if !hasFabricInterface() {
-		t.Fatal("hasFabricInterface() = false with rdma3 present")
+	if err := os.WriteFile(filepath.Join(sysClassNet, "rdma3", "type"), []byte("32\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() returned error: %v", err)
+	}
+	if hasEthernetFabricInterface() {
+		t.Fatal("hasEthernetFabricInterface() = true with only native InfiniBand")
+	}
+	if err := os.Mkdir(filepath.Join(sysClassNet, "rdma4"), 0o755); err != nil {
+		t.Fatalf("Mkdir() returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sysClassNet, "rdma4", "type"), []byte("1\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() returned error: %v", err)
+	}
+	if !hasEthernetFabricInterface() {
+		t.Fatal("hasEthernetFabricInterface() = false with an Ethernet fabric interface")
 	}
 }
 
@@ -573,10 +618,11 @@ func TestGetDeviceConfig(t *testing.T) {
 	ipv4Instance := newOKEInstance(&okeMetadata{RDMAFabric: &RDMAFabric{IPv6: false, Planes: 0}}, nil)
 
 	tests := []struct {
-		name     string
-		instance *OKEInstance
-		id       cloudprovider.DeviceIdentifiers
-		want     *apis.NetworkConfig
+		name                   string
+		instance               *OKEInstance
+		id                     cloudprovider.DeviceIdentifiers
+		want                   *apis.NetworkConfig
+		wantRequiresFabricData bool
 	}{
 		{
 			name:     "fabric interface",
@@ -590,6 +636,7 @@ func TestGetDeviceConfig(t *testing.T) {
 				},
 				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
 			},
+			wantRequiresFabricData: true,
 		},
 		{
 			name:     "IPv6 fabric uses address-free ipvlan",
@@ -599,6 +646,7 @@ func TestGetDeviceConfig(t *testing.T) {
 				Type:        apis.SubInterfaceTypeIPVlan,
 				AddressMode: apis.SubInterfaceAddressModeSLAAC,
 			}},
+			wantRequiresFabricData: true,
 		},
 		{
 			name:     "missing fabric data keeps a failing profile",
@@ -608,6 +656,7 @@ func TestGetDeviceConfig(t *testing.T) {
 				Profile:      okeRDMAIPv4Profile,
 				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
 			},
+			wantRequiresFabricData: true,
 		},
 		{
 			name: "non-fabric interface",
@@ -646,6 +695,7 @@ func TestGetDeviceConfig(t *testing.T) {
 				Interface:    apis.InterfaceConfig{ARPAnnounce: ptr.To[int32](2)},
 				SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
 			},
+			wantRequiresFabricData: true,
 		},
 	}
 
@@ -658,6 +708,9 @@ func TestGetDeviceConfig(t *testing.T) {
 			got := instance.GetDeviceConfig(tt.id)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("GetDeviceConfig() mismatch (-want +got):\n%s", diff)
+			}
+			if got := instance.requiresFabricData.Load(); got != tt.wantRequiresFabricData {
+				t.Errorf("requiresFabricData = %v, want %v", got, tt.wantRequiresFabricData)
 			}
 		})
 	}

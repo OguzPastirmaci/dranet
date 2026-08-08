@@ -72,7 +72,7 @@ const (
 	imdsInitialWait          = 15 * time.Second
 	imdsRetryInterval        = 10 * time.Second
 	imdsMaxRetryInterval     = 30 * time.Second
-	imdsRefreshInterval      = 30 * time.Minute
+	imdsRefreshInterval      = 15 * time.Minute
 	imdsRequestTimeout       = 15 * time.Second
 )
 
@@ -139,7 +139,8 @@ var _ cloudprovider.ProfileProvider = (*OKEInstance)(nil)
 type OKEInstance struct {
 	metadata           atomic.Pointer[okeMetadata]
 	fetchMetadata      metadataFetcher
-	requiresFabricData bool
+	requiresFabricData atomic.Bool
+	refreshMetadataNow chan struct{}
 	retryInterval      time.Duration
 	maxRetryInterval   time.Duration
 	refreshInterval    time.Duration
@@ -148,11 +149,12 @@ type OKEInstance struct {
 
 func newOKEInstance(metadata *okeMetadata, fetch metadataFetcher) *OKEInstance {
 	instance := &OKEInstance{
-		fetchMetadata:    fetch,
-		retryInterval:    imdsRetryInterval,
-		maxRetryInterval: imdsMaxRetryInterval,
-		refreshInterval:  imdsRefreshInterval,
-		requestTimeout:   imdsRequestTimeout,
+		fetchMetadata:      fetch,
+		refreshMetadataNow: make(chan struct{}, 1),
+		retryInterval:      imdsRetryInterval,
+		maxRetryInterval:   imdsMaxRetryInterval,
+		refreshInterval:    imdsRefreshInterval,
+		requestTimeout:     imdsRequestTimeout,
 	}
 	if metadata != nil {
 		instance.metadata.Store(metadata)
@@ -239,6 +241,7 @@ func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.
 		klog.Warningf("OKE interface %s for device %s has unsupported ARPHRD type %d", ifName, id.Name, hardwareType)
 		return config
 	}
+	o.requireFabricData()
 	metadata := o.metadata.Load()
 	if metadata == nil || metadata.RDMAFabric == nil {
 		klog.Warningf("OKE RDMA fabric data is not available for device %s", id.Name)
@@ -410,13 +413,17 @@ func isFabricInterface(ifName string) bool {
 	return err == nil
 }
 
-func hasFabricInterface() bool {
+func hasEthernetFabricInterface() bool {
 	entries, err := os.ReadDir(sysClassNet)
 	if err != nil {
 		return false
 	}
 	for _, entry := range entries {
-		if isFabricInterface(entry.Name()) {
+		if !isFabricInterface(entry.Name()) {
+			continue
+		}
+		hardwareType, err := interfaceHardwareType(entry.Name())
+		if err == nil && hardwareType == arpHardwareTypeEthernet {
 			return true
 		}
 	}
@@ -696,7 +703,17 @@ func (o *OKEInstance) refreshMetadata(ctx context.Context) error {
 
 func (o *OKEInstance) metadataComplete() bool {
 	metadata := o.metadata.Load()
-	return metadata != nil && (!o.requiresFabricData || metadata.RDMAFabric != nil)
+	return metadata != nil && (!o.requiresFabricData.Load() || metadata.RDMAFabric != nil)
+}
+
+func (o *OKEInstance) requireFabricData() {
+	if !o.requiresFabricData.CompareAndSwap(false, true) || o.metadataComplete() {
+		return
+	}
+	select {
+	case o.refreshMetadataNow <- struct{}{}:
+	default:
+	}
 }
 
 func (o *OKEInstance) refreshLoop(ctx context.Context) {
@@ -715,6 +732,13 @@ func (o *OKEInstance) refreshLoop(ctx context.Context) {
 				<-timer.C
 			}
 			return
+		case <-o.refreshMetadataNow:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		case <-timer.C:
 		}
 
@@ -740,11 +764,11 @@ func (o *OKEInstance) refreshLoop(ctx context.Context) {
 // GetInstance reads OKE topology and RDMA fabric metadata from OCI IMDS.
 // It refreshes the metadata and keeps the last complete fabric data.
 func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
-	requiresFabricData := hasFabricInterface()
-	instance := newOKEInstance(nil, func(ctx context.Context) (*okeMetadata, error) {
-		return fetchOKEMetadata(ctx, http.DefaultClient, imdsEndpoint, requiresFabricData)
-	})
-	instance.requiresFabricData = requiresFabricData
+	instance := newOKEInstance(nil, nil)
+	instance.fetchMetadata = func(ctx context.Context) (*okeMetadata, error) {
+		return fetchOKEMetadata(ctx, http.DefaultClient, imdsEndpoint, instance.requiresFabricData.Load())
+	}
+	instance.requiresFabricData.Store(hasEthernetFabricInterface())
 	err := wait.PollUntilContextTimeout(ctx, imdsInitialRetryInterval, imdsInitialWait, true, func(ctx context.Context) (bool, error) {
 		if err := instance.refreshMetadata(ctx); err != nil {
 			klog.Infof("Could not get complete OCI IMDS metadata; retrying: %v", err)
