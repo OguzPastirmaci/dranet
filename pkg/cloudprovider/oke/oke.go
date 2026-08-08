@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -30,6 +29,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -47,7 +47,6 @@ const (
 	fabricInterfacePrefix = "rdma"
 	okeRDMAIPv4Profile    = "oke-rdma-ipv4"
 	okeRDMASBRTableBase   = 100
-	okeRDMAMaxRailIndex   = 15
 
 	// OCA assigns B4 RDMA parent addresses from this /15. DRANET uses a
 	// separate /15 for one deterministic IPvlan child per parent.
@@ -55,18 +54,28 @@ const (
 	okeRDMAChildIPv4CIDR  = "10.240.0.0/15"
 
 	// RDMA topology attributes (from /opc/v2/host/).
-	AttrOKEHPCIslandId     = OKEAttrPrefix + "/" + "hpcIslandId"
-	AttrOKENetworkBlockId  = OKEAttrPrefix + "/" + "networkBlockId"
-	AttrOKELocalBlockId    = OKEAttrPrefix + "/" + "localBlockId"
-	AttrOKERackId          = OKEAttrPrefix + "/" + "rackId"
-	AttrOKEGpuMemoryFabric = OKEAttrPrefix + "/" + "gpuMemoryFabricId"
+	AttrOKEHPCIslandId      = OKEAttrPrefix + "/" + "hpcIslandId"
+	AttrOKENetworkBlockId   = OKEAttrPrefix + "/" + "networkBlockId"
+	AttrOKELocalBlockId     = OKEAttrPrefix + "/" + "localBlockId"
+	AttrOKERackId           = OKEAttrPrefix + "/" + "rackId"
+	AttrOKEGpuMemoryFabric  = OKEAttrPrefix + "/" + "gpuMemoryFabricId"
+	AttrOKERDMAFabricIPv6   = OKEAttrPrefix + "/" + "rdmaFabricIpv6"
+	AttrOKERDMAFabricPlanes = OKEAttrPrefix + "/" + "rdmaFabricPlanes"
 
 	// imdsEndpoint is the Oracle Cloud Instance Metadata Service endpoint.
 	imdsEndpoint = "http://169.254.169.254/opc/v2"
+
+	imdsInitialRetryInterval = 1 * time.Second
+	imdsInitialWait          = 15 * time.Second
+	imdsRetryInterval        = 10 * time.Second
+	imdsMaxRetryInterval     = 30 * time.Second
+	imdsRefreshInterval      = 30 * time.Minute
+	imdsRequestTimeout       = 15 * time.Second
 )
 
 var (
 	sysfsPCIDevices    = "/sys/bus/pci/devices"
+	sysClassNet        = "/sys/class/net"
 	procSysNetIPv4Conf = "/proc/sys/net/ipv4/conf"
 	interfaceAddresses = func(ifName string) ([]net.Addr, error) {
 		iface, err := net.InterfaceByName(ifName)
@@ -88,27 +97,63 @@ type imdsHostRDMATopologyData struct {
 	CustomerNetworkBlock    string `json:"customerNetworkBlock"`
 }
 
+// imdsRDMAFabricData contains /opc/v2/host/rdmaFabricData from OCI IMDS.
+type imdsRDMAFabricData struct {
+	IPv6   *bool  `json:"ipv6"`
+	Planes *int64 `json:"planes"`
+}
+
 // imdsHostMetadata contains the fields we care about from the OCI IMDS
 // host metadata response at /opc/v2/host/.
 type imdsHostMetadata struct {
 	NetworkBlockId   string                    `json:"networkBlockId"`
 	RackId           string                    `json:"rackId"`
 	RDMATopologyData *imdsHostRDMATopologyData `json:"rdmaTopologyData"`
+	RDMAFabricData   *imdsRDMAFabricData       `json:"rdmaFabricData"`
 }
+
+// RDMAFabric describes the RDMA fabric for this instance.
+type RDMAFabric struct {
+	IPv6   bool
+	Planes int64
+}
+
+type okeMetadata struct {
+	HPCIslandId     string
+	NetworkBlockId  string
+	LocalBlockId    string
+	RackId          string
+	GpuMemoryFabric string
+	RDMAFabric      *RDMAFabric
+}
+
+type metadataFetcher func(context.Context) (*okeMetadata, error)
 
 var _ cloudprovider.CloudInstance = (*OKEInstance)(nil)
 var _ cloudprovider.ProfileProvider = (*OKEInstance)(nil)
 
 // OKEInstance holds OCI/OKE specific instance topology data.
 type OKEInstance struct {
-	HPCIslandId    string
-	NetworkBlockId string
-	LocalBlockId   string
-	RackId         string
-	// GpuMemoryFabric is only populated on shapes that use a GPU memory fabric
-	// interconnect (e.g. BM.GPU.GB200, BM.GPU.GB300). It will be empty on all
-	// other shapes such as BM.GPU.H100.8.
-	GpuMemoryFabric string
+	metadata         atomic.Pointer[okeMetadata]
+	fetchMetadata    metadataFetcher
+	retryInterval    time.Duration
+	maxRetryInterval time.Duration
+	refreshInterval  time.Duration
+	requestTimeout   time.Duration
+}
+
+func newOKEInstance(metadata *okeMetadata, fetch metadataFetcher) *OKEInstance {
+	instance := &OKEInstance{
+		fetchMetadata:    fetch,
+		retryInterval:    imdsRetryInterval,
+		maxRetryInterval: imdsMaxRetryInterval,
+		refreshInterval:  imdsRefreshInterval,
+		requestTimeout:   imdsRequestTimeout,
+	}
+	if metadata != nil {
+		instance.metadata.Store(metadata)
+	}
+	return instance
 }
 
 // GetDeviceAttributes returns OKE-specific topology attributes for a device.
@@ -116,21 +161,29 @@ type OKEInstance struct {
 // host endpoint exposes per-node topology, not per-NIC metadata.
 func (o *OKEInstance) GetDeviceAttributes(id cloudprovider.DeviceIdentifiers) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	attributes := make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute)
+	metadata := o.metadata.Load()
+	if metadata == nil {
+		return attributes
+	}
 
-	if o.HPCIslandId != "" {
-		attributes[AttrOKEHPCIslandId] = resourceapi.DeviceAttribute{StringValue: &o.HPCIslandId}
+	if metadata.HPCIslandId != "" {
+		attributes[AttrOKEHPCIslandId] = resourceapi.DeviceAttribute{StringValue: &metadata.HPCIslandId}
 	}
-	if o.NetworkBlockId != "" {
-		attributes[AttrOKENetworkBlockId] = resourceapi.DeviceAttribute{StringValue: &o.NetworkBlockId}
+	if metadata.NetworkBlockId != "" {
+		attributes[AttrOKENetworkBlockId] = resourceapi.DeviceAttribute{StringValue: &metadata.NetworkBlockId}
 	}
-	if o.LocalBlockId != "" {
-		attributes[AttrOKELocalBlockId] = resourceapi.DeviceAttribute{StringValue: &o.LocalBlockId}
+	if metadata.LocalBlockId != "" {
+		attributes[AttrOKELocalBlockId] = resourceapi.DeviceAttribute{StringValue: &metadata.LocalBlockId}
 	}
-	if o.RackId != "" {
-		attributes[AttrOKERackId] = resourceapi.DeviceAttribute{StringValue: &o.RackId}
+	if metadata.RackId != "" {
+		attributes[AttrOKERackId] = resourceapi.DeviceAttribute{StringValue: &metadata.RackId}
 	}
-	if o.GpuMemoryFabric != "" {
-		attributes[AttrOKEGpuMemoryFabric] = resourceapi.DeviceAttribute{StringValue: &o.GpuMemoryFabric}
+	if metadata.GpuMemoryFabric != "" {
+		attributes[AttrOKEGpuMemoryFabric] = resourceapi.DeviceAttribute{StringValue: &metadata.GpuMemoryFabric}
+	}
+	if metadata.RDMAFabric != nil {
+		attributes[AttrOKERDMAFabricIPv6] = resourceapi.DeviceAttribute{BoolValue: &metadata.RDMAFabric.IPv6}
+		attributes[AttrOKERDMAFabricPlanes] = resourceapi.DeviceAttribute{IntValue: &metadata.RDMAFabric.Planes}
 	}
 
 	return attributes
@@ -158,8 +211,8 @@ func ocidSuffix(s string) (string, error) {
 	return suffix, nil
 }
 
-// GetDeviceConfig keeps OKE fabric interfaces on the host. It selects the
-// IPv4 child profile and applies the parent ARP policy to the IPvlan child.
+// GetDeviceConfig keeps OKE fabric interfaces on the host. IPv4 fabrics use
+// deterministic addresses. IPv6 fabrics use address-free children for SLAAC.
 func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.NetworkConfig {
 	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
 	if err != nil || !isFabricInterface(ifName) {
@@ -169,6 +222,15 @@ func (o *OKEInstance) GetDeviceConfig(id cloudprovider.DeviceIdentifiers) *apis.
 	config := &apis.NetworkConfig{
 		Profile:      okeRDMAIPv4Profile,
 		SubInterface: &apis.SubInterfaceConfig{Type: apis.SubInterfaceTypeIPVlan},
+	}
+	metadata := o.metadata.Load()
+	if metadata == nil || metadata.RDMAFabric == nil {
+		klog.Warningf("OKE RDMA fabric data is not available for device %s", id.Name)
+		return config
+	}
+	if metadata.RDMAFabric.IPv6 {
+		config.Profile = ""
+		return config
 	}
 
 	arpIgnore, err := readARPSysctl(ifName, "arp_ignore")
@@ -200,6 +262,13 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ typ
 	if config.SubInterface == nil || config.SubInterface.Type != apis.SubInterfaceTypeIPVlan {
 		return nil, fmt.Errorf("OKE profile %q requires an ipvlan subinterface", config.Profile)
 	}
+	metadata := o.metadata.Load()
+	if metadata == nil || metadata.RDMAFabric == nil {
+		return nil, errors.New("OKE RDMA fabric data is not available")
+	}
+	if metadata.RDMAFabric.IPv6 {
+		return nil, fmt.Errorf("OKE profile %q does not support an IPv6 RDMA fabric", config.Profile)
+	}
 
 	ifName, err := interfaceNameForPCIAddress(id.PCIAddress)
 	if err != nil {
@@ -208,9 +277,6 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ typ
 	railIndex, err := fabricInterfaceIndex(ifName)
 	if err != nil {
 		return nil, err
-	}
-	if railIndex > okeRDMAMaxRailIndex {
-		return nil, fmt.Errorf("OKE IPv4 profile supports rdma0 through rdma%d, got %q", okeRDMAMaxRailIndex, ifName)
 	}
 
 	parentAddr, err := parentIPv4Address(ifName)
@@ -300,6 +366,19 @@ func isFabricInterface(ifName string) bool {
 	return err == nil
 }
 
+func hasFabricInterface() bool {
+	entries, err := os.ReadDir(sysClassNet)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if isFabricInterface(entry.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
 func fabricInterfaceIndex(ifName string) (int, error) {
 	index, ok := strings.CutPrefix(ifName, fabricInterfacePrefix)
 	if !ok || index == "" {
@@ -377,86 +456,233 @@ func OnOKE(ctx context.Context) bool {
 	}) == nil
 }
 
+func queryRDMAFabricData(ctx context.Context, client *http.Client, endpoint string) (*imdsRDMAFabricData, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not create OCI IMDS RDMA fabric request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer Oracle")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("could not reach OCI IMDS RDMA fabric endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OCI IMDS RDMA fabric endpoint returned status %d", resp.StatusCode)
+	}
+
+	var data imdsRDMAFabricData
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("could not parse OCI IMDS RDMA fabric response: %w", err)
+	}
+	return &data, nil
+}
+
+func queryHostMetadata(ctx context.Context, client *http.Client, endpoint string) (*imdsHostMetadata, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not create OCI IMDS host request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer Oracle")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("could not reach OCI IMDS host endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OCI IMDS host endpoint returned status %d", resp.StatusCode)
+	}
+
+	var metadata imdsHostMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+		return nil, fmt.Errorf("could not parse OCI IMDS host response: %w", err)
+	}
+	return &metadata, nil
+}
+
+func parseRDMAFabricData(data *imdsRDMAFabricData) (*RDMAFabric, error) {
+	if data == nil {
+		return nil, nil
+	}
+	if data.IPv6 == nil {
+		return nil, errors.New("OCI IMDS RDMA fabric response does not contain ipv6")
+	}
+	if data.Planes == nil {
+		return nil, errors.New("OCI IMDS RDMA fabric response does not contain planes")
+	}
+	return &RDMAFabric{IPv6: *data.IPv6, Planes: *data.Planes}, nil
+}
+
+func metadataFromIMDS(host *imdsHostMetadata, fabricData *imdsRDMAFabricData) (*okeMetadata, error) {
+	fabric, err := parseRDMAFabricData(fabricData)
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := &okeMetadata{
+		NetworkBlockId: host.NetworkBlockId,
+		RackId:         host.RackId,
+		RDMAFabric:     fabric,
+	}
+	topo := host.RDMATopologyData
+	if topo == nil {
+		return metadata, nil
+	}
+
+	metadata.HPCIslandId, err = ocidSuffix(topo.CustomerHPCIslandId)
+	if err != nil {
+		return nil, fmt.Errorf("invalid HPCIslandId: %w", err)
+	}
+	metadata.NetworkBlockId, err = ocidSuffix(topo.CustomerNetworkBlock)
+	if err != nil {
+		return nil, fmt.Errorf("invalid NetworkBlockId: %w", err)
+	}
+	metadata.LocalBlockId, err = ocidSuffix(topo.CustomerLocalBlock)
+	if err != nil {
+		return nil, fmt.Errorf("invalid LocalBlockId: %w", err)
+	}
+	metadata.GpuMemoryFabric, err = ocidSuffix(topo.CustomerGpuMemoryFabric)
+	if err != nil {
+		return nil, fmt.Errorf("invalid GpuMemoryFabric: %w", err)
+	}
+	return metadata, nil
+}
+
+func fetchOKEMetadata(ctx context.Context, client *http.Client, endpoint string) (*okeMetadata, error) {
+	host, err := queryHostMetadata(ctx, client, endpoint+"/host/")
+	if err != nil {
+		return nil, err
+	}
+
+	fabricData := host.RDMAFabricData
+	if hasFabricInterface() {
+		fabricData, err = queryRDMAFabricData(ctx, client, endpoint+"/host/rdmaFabricData/")
+		if err != nil {
+			return nil, err
+		}
+		if fabricData == nil {
+			return nil, errors.New("OCI IMDS RDMA fabric response is empty")
+		}
+	}
+	return metadataFromIMDS(host, fabricData)
+}
+
+func mergeMetadata(current, next *okeMetadata) (*okeMetadata, bool) {
+	if current == nil {
+		return next, false
+	}
+
+	merged := *next
+	if merged.HPCIslandId == "" {
+		merged.HPCIslandId = current.HPCIslandId
+	}
+	if merged.NetworkBlockId == "" {
+		merged.NetworkBlockId = current.NetworkBlockId
+	}
+	if merged.LocalBlockId == "" {
+		merged.LocalBlockId = current.LocalBlockId
+	}
+	if merged.RackId == "" {
+		merged.RackId = current.RackId
+	}
+	if merged.GpuMemoryFabric == "" {
+		merged.GpuMemoryFabric = current.GpuMemoryFabric
+	}
+
+	familyChanged := false
+	if merged.RDMAFabric == nil {
+		merged.RDMAFabric = current.RDMAFabric
+	} else if current.RDMAFabric != nil {
+		fabric := *merged.RDMAFabric
+		if fabric.IPv6 != current.RDMAFabric.IPv6 {
+			familyChanged = true
+			fabric.IPv6 = current.RDMAFabric.IPv6
+		}
+		merged.RDMAFabric = &fabric
+	}
+	return &merged, familyChanged
+}
+
+func (o *OKEInstance) refreshMetadata(ctx context.Context) error {
+	if o.fetchMetadata == nil {
+		return errors.New("OKE metadata fetcher is not configured")
+	}
+
+	next, err := o.fetchMetadata(ctx)
+	if err != nil {
+		return err
+	}
+	if next == nil {
+		return errors.New("OCI IMDS returned empty metadata")
+	}
+
+	merged, familyChanged := mergeMetadata(o.metadata.Load(), next)
+	if familyChanged {
+		klog.Errorf("OCI IMDS changed the RDMA fabric IP version; keeping the initial value")
+	}
+	o.metadata.Store(merged)
+	return nil
+}
+
+func (o *OKEInstance) refreshLoop(ctx context.Context) {
+	retrying := o.metadata.Load() == nil
+	retryInterval := o.retryInterval
+	for {
+		interval := o.refreshInterval
+		if retrying {
+			interval = retryInterval
+		}
+
+		timer := time.NewTimer(wait.Jitter(interval, 0.1))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+
+		requestCtx, cancel := context.WithTimeout(ctx, o.requestTimeout)
+		err := o.refreshMetadata(requestCtx)
+		cancel()
+		if err != nil {
+			klog.Warningf("Could not refresh OCI IMDS metadata; keeping the last known values: %v", err)
+			retrying = true
+			retryInterval *= 2
+			if retryInterval > o.maxRetryInterval {
+				retryInterval = o.maxRetryInterval
+			}
+			continue
+		}
+		retrying = false
+		retryInterval = o.retryInterval
+	}
+}
+
 // GetInstance retrieves OCI instance topology by querying the IMDS host endpoint.
 // On shapes with RDMA topology data (GB200, GB300), all five topology attributes
 // are populated. On shapes without it (H100, etc.), only NetworkBlockId and
 // RackId are available from the host metadata.
 func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
-	var instance *OKEInstance
-	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, imdsEndpoint+"/host/", nil)
-		if err != nil {
-			klog.Infof("could not create OCI IMDS host request ... retrying: %v", err)
+	instance := newOKEInstance(nil, func(ctx context.Context) (*okeMetadata, error) {
+		return fetchOKEMetadata(ctx, http.DefaultClient, imdsEndpoint)
+	})
+	err := wait.PollUntilContextTimeout(ctx, imdsInitialRetryInterval, imdsInitialWait, true, func(ctx context.Context) (bool, error) {
+		if err := instance.refreshMetadata(ctx); err != nil {
+			klog.Infof("Could not get complete OCI IMDS metadata; retrying: %v", err)
 			return false, nil
-		}
-		req.Header.Set("Authorization", "Bearer Oracle")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			klog.Infof("could not reach OCI IMDS host endpoint ... retrying: %v", err)
-			return false, nil
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			klog.Infof("OCI IMDS host endpoint returned status %d ... retrying", resp.StatusCode)
-			return false, nil
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			klog.Infof("could not read OCI IMDS host response ... retrying: %v", err)
-			return false, nil
-		}
-
-		var metadata imdsHostMetadata
-		if err := json.Unmarshal(body, &metadata); err != nil {
-			return false, fmt.Errorf("could not parse OCI IMDS host response: %w", err)
-		}
-
-		// rdmaTopologyData is absent on non-fabric shapes (H100, etc.).
-		// Fall back to the top-level networkBlockId and rackId which are
-		// available on all shapes that expose the /host/ endpoint.
-		topo := metadata.RDMATopologyData
-		if topo == nil {
-			instance = &OKEInstance{
-				NetworkBlockId: metadata.NetworkBlockId,
-				RackId:         metadata.RackId,
-			}
-			return true, nil
-		}
-
-		hpcIslandId, err := ocidSuffix(topo.CustomerHPCIslandId)
-		if err != nil {
-			return false, fmt.Errorf("invalid HPCIslandId: %w", err)
-		}
-		networkBlockId, err := ocidSuffix(topo.CustomerNetworkBlock)
-		if err != nil {
-			return false, fmt.Errorf("invalid NetworkBlockId: %w", err)
-		}
-		localBlockId, err := ocidSuffix(topo.CustomerLocalBlock)
-		if err != nil {
-			return false, fmt.Errorf("invalid LocalBlockId: %w", err)
-		}
-		gpuMemoryFabric, err := ocidSuffix(topo.CustomerGpuMemoryFabric)
-		if err != nil {
-			return false, fmt.Errorf("invalid GpuMemoryFabric: %w", err)
-		}
-
-		instance = &OKEInstance{
-			HPCIslandId:     hpcIslandId,
-			NetworkBlockId:  networkBlockId,
-			LocalBlockId:    localBlockId,
-			RackId:          metadata.RackId,
-			GpuMemoryFabric: gpuMemoryFabric,
 		}
 		return true, nil
 	})
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("please enable TopologyData for your tenancy: %w", err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		return nil, err
+		klog.Warningf("OCI IMDS metadata is not ready; continuing retries in the background: %v", err)
 	}
+	go instance.refreshLoop(ctx)
 	return instance, nil
 }

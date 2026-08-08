@@ -462,13 +462,10 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Name = string(subInterfaceType) + "-" + ifName
 			}
 
-			// If not specified, assign an IP address from the configured IP ranges using node local IPAM.
-			if len(deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses) == 0 {
+			// Allocate from configured ranges when no static address is specified.
+			if len(deviceCfg.NetworkInterfaceConfigInPod.SubInterface.Addresses) == 0 &&
+				len(deviceCfg.NetworkInterfaceConfigInPod.SubInterface.IPRanges) > 0 {
 				ipRanges := deviceCfg.NetworkInterfaceConfigInPod.SubInterface.IPRanges
-				if len(ipRanges) == 0 {
-					errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s, no IPRanges specified", ifName))
-					continue
-				}
 				if np.localIPAM == nil {
 					errorList = append(errorList, fmt.Errorf("can't assign IP for subinterface %s, IPAM database not initialized", ifName))
 					continue
