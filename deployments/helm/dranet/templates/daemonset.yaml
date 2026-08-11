@@ -80,7 +80,7 @@ spec:
             {{- range $k := (keys .Values.cloudProviderOptions | sortAlpha) }}
             {{- $opts = append $opts (printf "%s=%s" $k (get $.Values.cloudProviderOptions $k)) }}
             {{- end }}
-            - --cloud-provider-options={{ join "," $opts }}
+            - {{ printf "--cloud-provider-options=%s" (join "," $opts) | quote }}
             {{- end }}
             {{- if (hasKey .Values.args "profileProvider") }}
             - {{ printf "--profile-provider=%s" .Values.args.profileProvider | quote }}

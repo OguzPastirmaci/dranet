@@ -19,10 +19,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 )
 
@@ -175,19 +178,30 @@ func TestSetupProvidersRejectsBadOptions(t *testing.T) {
 	okeOption := map[string]string{"oke.child-ipv4-cidr": "10.192.0.0/15"}
 
 	tests := []struct {
-		name    string
-		hint    string
-		options map[string]string
+		name         string
+		hint         string
+		options      map[string]string
+		wantContains string
+		wantSentinel bool
 	}{
-		{name: "options require an explicit hint", hint: "", options: okeOption},
-		{name: "options must match the hint namespace", hint: "GCE", options: okeOption},
-		{name: "no provider defines options yet", hint: "OKE", options: okeOption},
+		{name: "options require an explicit hint", hint: "", options: okeOption, wantContains: "--cloud-provider-hint"},
+		{name: "options must match the hint namespace", hint: "GCE", options: okeOption, wantContains: "does not match"},
+		// The oke.* option only reaches discovery under hint "OKE" because
+		// strings.EqualFold accepts the case-insensitive match, so this case
+		// also proves the namespace match is case-insensitive.
+		{name: "no provider defines options yet", hint: "OKE", options: okeOption, wantSentinel: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, _, err := setupProviders(ctx, tt.hint, "cloud", "", tt.options)
 			if err == nil {
 				t.Fatalf("setupProviders(hint=%q, options=%v) returned no error", tt.hint, tt.options)
+			}
+			if tt.wantContains != "" && !strings.Contains(err.Error(), tt.wantContains) {
+				t.Errorf("setupProviders() error = %q, want it to contain %q", err.Error(), tt.wantContains)
+			}
+			if tt.wantSentinel && !errors.Is(err, discovery.ErrInvalidProviderOptions) {
+				t.Errorf("setupProviders() error = %v, want errors.Is(err, discovery.ErrInvalidProviderOptions)", err)
 			}
 		})
 	}

@@ -70,6 +70,7 @@ helm upgrade --install dranet ./deployments/helm/dranet -n kube-system -f my-val
 `--cloud-provider-options` as comma-separated `<provider>.<option>=<value>`
 pairs. Setting any option requires `args.cloudProviderHint`. Values must
 not contain secrets because DRANET logs its command-line flags.
+Values cannot contain commas.
 
 No options are currently defined. Providers document their keys when they
 add them.

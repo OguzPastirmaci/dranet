@@ -259,7 +259,7 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 	// discovery, whose IMDS probes can fail temporarily at boot.
 	if len(providerOptions) > 0 {
 		if cloudProviderHint == "" {
-			return nil, nil, fmt.Errorf("cloud provider options require an explicit --cloud-provider-hint")
+			return nil, nil, errors.New("cloud provider options require an explicit --cloud-provider-hint")
 		}
 		for key := range providerOptions {
 			namespace, _, _ := strings.Cut(key, ".")

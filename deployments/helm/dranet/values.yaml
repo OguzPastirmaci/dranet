@@ -37,6 +37,7 @@ args: {}
 # Requires args.cloudProviderHint. No options are currently defined;
 # providers document their keys when they add them.
 # Values must not contain secrets; DRANET logs its command-line flags.
+# Values cannot contain commas.
 cloudProviderOptions: {}
 
 # kubeletRootDir is the kubelet data directory (its --root-dir). The driver's

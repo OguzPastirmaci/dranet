@@ -49,7 +49,7 @@ func parseCloudProviderOptions(value string) (map[string]string, error) {
 			return nil, fmt.Errorf("cloud provider option key %q must use the <provider>.<option> format", key)
 		}
 		if !allowedOptionNamespaces[namespace] {
-			return nil, fmt.Errorf("cloud provider option namespace %q is not supported", namespace)
+			return nil, fmt.Errorf("cloud provider option namespace %q is not supported (supported: gce, aws, azure, oke, alibaba, webhook)", namespace)
 		}
 		if _, exists := options[key]; exists {
 			return nil, fmt.Errorf("duplicate cloud provider option %q", key)
