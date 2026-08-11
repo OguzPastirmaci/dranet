@@ -63,3 +63,13 @@ Parameters can be set at install time using `--set` or a custom values file:
 helm upgrade --install dranet ./deployments/helm/dranet -n kube-system --set logVerbosity=6
 helm upgrade --install dranet ./deployments/helm/dranet -n kube-system -f my-values.yaml
 ```
+
+## Cloud provider options
+
+`cloudProviderOptions` renders provider-specific options into
+`--cloud-provider-options` as comma-separated `<provider>.<option>=<value>`
+pairs. Setting any option requires `args.cloudProviderHint`. Values must
+not contain secrets because DRANET logs its command-line flags.
+
+No options are currently defined. Providers document their keys when they
+add them.

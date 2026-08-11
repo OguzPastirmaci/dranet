@@ -156,6 +156,12 @@
         }
       ]
     },
+    "cloudProviderOptions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
     "nodeSelector": {
       "type": "object"
     },
