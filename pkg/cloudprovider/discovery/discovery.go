@@ -18,6 +18,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"cloud.google.com/go/compute/metadata"
@@ -41,6 +42,10 @@ const (
 	CloudProviderHintWebhook CloudProviderHint = "webhook"
 	CloudProviderHintNone    CloudProviderHint = "NONE"
 )
+
+// ErrInvalidProviderOptions marks configuration errors that must stop DRANET
+// instead of falling back to a nil cloud provider.
+var ErrInvalidProviderOptions = errors.New("invalid cloud provider options")
 
 // DiscoverCloudProvider probes the environment to detect which cloud provider DRANET is running on.
 func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProviderHint {
@@ -66,7 +71,12 @@ func DiscoverCloudProvider(ctx context.Context, webhookURL string) CloudProvider
 }
 
 // GetInstanceProperties initializes and returns the specified cloud provider instance.
-func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string) (cloudprovider.CloudInstance, error) {
+func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string, options map[string]string) (cloudprovider.CloudInstance, error) {
+	// No provider defines options yet. A provider that adds one replaces
+	// this rejection with its own validation and constructor wiring.
+	if len(options) > 0 {
+		return nil, fmt.Errorf("%w: provider %s defines no options", ErrInvalidProviderOptions, hint)
+	}
 	switch hint {
 	case CloudProviderHintGCE:
 		return gce.GetInstance(ctx)

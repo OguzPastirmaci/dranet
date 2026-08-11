@@ -153,7 +153,7 @@ func TestSetupProviders(t *testing.T) {
 				endpoint = srv.URL
 			}
 
-			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint)
+			cloudInst, profProv, err := setupProviders(ctx, tt.cloudProviderHint, tt.profileProvider, endpoint, nil)
 
 			if (err != nil) != tt.expectErr {
 				t.Errorf("expected error: %v, got: %v", tt.expectErr, err)
@@ -165,6 +165,29 @@ func TestSetupProviders(t *testing.T) {
 
 			if (profProv != nil) != tt.expectProfProv {
 				t.Errorf("expected profProv: %v, got: %v", tt.expectProfProv, profProv != nil)
+			}
+		})
+	}
+}
+
+func TestSetupProvidersRejectsBadOptions(t *testing.T) {
+	ctx := context.Background()
+	okeOption := map[string]string{"oke.child-ipv4-cidr": "10.192.0.0/15"}
+
+	tests := []struct {
+		name    string
+		hint    string
+		options map[string]string
+	}{
+		{name: "options require an explicit hint", hint: "", options: okeOption},
+		{name: "options must match the hint namespace", hint: "GCE", options: okeOption},
+		{name: "no provider defines options yet", hint: "OKE", options: okeOption},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := setupProviders(ctx, tt.hint, "cloud", "", tt.options)
+			if err == nil {
+				t.Fatalf("setupProviders(hint=%q, options=%v) returned no error", tt.hint, tt.options)
 			}
 		})
 	}

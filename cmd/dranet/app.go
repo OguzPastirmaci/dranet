@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -194,7 +196,11 @@ func main() {
 		}
 		opts = append(opts, driver.WithFilter(prg))
 	}
-	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL)
+	providerOptions, err := parseCloudProviderOptions(cloudProviderOptions)
+	if err != nil {
+		klog.Fatalf("invalid --cloud-provider-options: %v", err)
+	}
+	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL, providerOptions)
 	if err != nil {
 		klog.Fatalf("failed to setup providers: %v", err)
 	}
@@ -248,7 +254,21 @@ func printVersion() {
 	klog.Infof("dranet go %s build: %s time: %s", info.GoVersion, vcsRevision, vcsTime)
 }
 
-func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
+func setupProviders(ctx context.Context, cloudProviderHint string, profileProvider string, webhookURL string, providerOptions map[string]string) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
+	// Static checks only: configuration validity must not depend on
+	// discovery, whose IMDS probes can fail temporarily at boot.
+	if len(providerOptions) > 0 {
+		if cloudProviderHint == "" {
+			return nil, nil, fmt.Errorf("cloud provider options require an explicit --cloud-provider-hint")
+		}
+		for key := range providerOptions {
+			namespace, _, _ := strings.Cut(key, ".")
+			if !strings.EqualFold(namespace, cloudProviderHint) {
+				return nil, nil, fmt.Errorf("cloud provider option %q does not match --cloud-provider-hint=%s", key, cloudProviderHint)
+			}
+		}
+	}
+
 	var cloudInst cloudprovider.CloudInstance
 	var profProv cloudprovider.ProfileProvider
 	var err error
@@ -262,8 +282,11 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 	}
 
 	// Setup the Underlay (Hardware Discovery / Cloud Instance Info)
-	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, webhookURL)
+	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, webhookURL, providerOptions)
 	if err != nil {
+		if errors.Is(err, discovery.ErrInvalidProviderOptions) {
+			return nil, nil, err
+		}
 		klog.Infof("failed to initialize cloud provider %q: %v", hint, err)
 		cloudInst = nil
 	}
