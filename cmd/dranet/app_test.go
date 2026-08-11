@@ -185,6 +185,7 @@ func TestSetupProvidersRejectsBadOptions(t *testing.T) {
 		wantSentinel bool
 	}{
 		{name: "options require an explicit hint", hint: "", options: okeOption, wantContains: "--cloud-provider-hint"},
+		{name: "options reject a non-canonical hint", hint: "oke", options: okeOption, wantContains: "canonical"},
 		{name: "options must match the hint namespace", hint: "GCE", options: okeOption, wantContains: "does not match"},
 		// The oke.* option only reaches discovery under hint "OKE" because
 		// strings.EqualFold accepts the case-insensitive match, so this case

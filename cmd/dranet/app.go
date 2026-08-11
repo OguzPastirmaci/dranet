@@ -110,6 +110,13 @@ func main() {
 		}
 	}
 
+	// Parse before any other startup work so a malformed option fails first,
+	// even outside a cluster where the Kubernetes client would fail earlier.
+	providerOptions, optionsErr := parseCloudProviderOptions(cloudProviderOptions)
+	if optionsErr != nil {
+		klog.Fatalf("invalid --cloud-provider-options: %v", optionsErr)
+	}
+
 	printVersion()
 	flag.VisitAll(func(f *flag.Flag) {
 		klog.Infof("FLAG: --%s=%q", f.Name, f.Value)
@@ -196,10 +203,6 @@ func main() {
 		}
 		opts = append(opts, driver.WithFilter(prg))
 	}
-	providerOptions, err := parseCloudProviderOptions(cloudProviderOptions)
-	if err != nil {
-		klog.Fatalf("invalid --cloud-provider-options: %v", err)
-	}
 	cloudInst, profProv, err := setupProviders(ctx, cloudProviderHint, profileProvider, webhookURL, providerOptions)
 	if err != nil {
 		klog.Fatalf("failed to setup providers: %v", err)
@@ -260,6 +263,14 @@ func setupProviders(ctx context.Context, cloudProviderHint string, profileProvid
 	if len(providerOptions) > 0 {
 		if cloudProviderHint == "" {
 			return nil, nil, errors.New("cloud provider options require an explicit --cloud-provider-hint")
+		}
+		// Discovery matches only the canonical hint values, so a lowercase
+		// hint would pass the namespace check and then select no provider.
+		switch discovery.CloudProviderHint(cloudProviderHint) {
+		case discovery.CloudProviderHintGCE, discovery.CloudProviderHintAWS, discovery.CloudProviderHintAzure,
+			discovery.CloudProviderHintOKE, discovery.CloudProviderHintAlibaba, discovery.CloudProviderHintWebhook:
+		default:
+			return nil, nil, fmt.Errorf("cloud provider options require a canonical --cloud-provider-hint (GCE, AWS, AZURE, OKE, ALIBABA, webhook), got %q", cloudProviderHint)
 		}
 		for key := range providerOptions {
 			namespace, _, _ := strings.Cut(key, ".")

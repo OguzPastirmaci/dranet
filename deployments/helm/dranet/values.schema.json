@@ -158,8 +158,12 @@
     },
     "cloudProviderOptions": {
       "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z]+\\.[^=,]+$"
+      },
       "additionalProperties": {
-        "type": "string"
+        "type": "string",
+        "pattern": "^[^,]*$"
       }
     },
     "nodeSelector": {
