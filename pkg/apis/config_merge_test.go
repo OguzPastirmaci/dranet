@@ -515,7 +515,7 @@ func cloneNetworkConfigForTest(t *testing.T, config *NetworkConfig) *NetworkConf
 	return copy
 }
 
-// These lists keep the merge helpers in sync with the configuration types.
+// These lists drive the list-based tests below and must match the configuration types.
 var deepCopyInterfacePointerFields = []string{
 	"DHCP",
 	"MTU",
@@ -569,12 +569,12 @@ func TestMergeFieldListsCoverMutableFields(t *testing.T) {
 	gotDeepCopy := listAsSet(mutableFieldPaths(reflect.TypeOf(NetworkConfig{}), ""))
 	for path := range gotDeepCopy {
 		if !wantDeepCopy[path] {
-			t.Errorf("mutable field %s is not covered by deepCopyNetworkConfig", path)
+			t.Errorf("mutable field %s is missing from the deep copy field lists", path)
 		}
 	}
 	for path := range wantDeepCopy {
 		if !gotDeepCopy[path] {
-			t.Errorf("deepCopyNetworkConfig lists unknown mutable field %s", path)
+			t.Errorf("the deep copy field lists name an unknown mutable field %s", path)
 		}
 	}
 
@@ -588,7 +588,7 @@ func TestMergeFieldListsCoverMutableFields(t *testing.T) {
 		}
 		if field.Type.Elem().Kind() != reflect.Struct {
 			if !zeroOverride[field.Name] {
-				t.Errorf("field %s is not covered by applyUserPointerOverrides", field.Name)
+				t.Errorf("pointer field %s is missing from the zero override field lists", field.Name)
 			}
 			continue
 		}
@@ -600,7 +600,7 @@ func TestMergeFieldListsCoverMutableFields(t *testing.T) {
 			}
 			path := field.Name + "." + nestedField.Name
 			if !nested[path] {
-				t.Errorf("field %s is not covered by applyUserPointerOverrides", path)
+				t.Errorf("pointer field %s is missing from the zero override field lists", path)
 			}
 		}
 	}
