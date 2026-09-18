@@ -18,6 +18,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -85,5 +86,24 @@ func TestGetInstancePropertiesCKS(t *testing.T) {
 func TestGetInstancePropertiesCKSRequiresDependencies(t *testing.T) {
 	if _, err := GetInstanceProperties(context.Background(), CloudProviderHintCKS, "", Dependencies{}); err == nil {
 		t.Fatal("GetInstanceProperties() error = nil, want missing Kubernetes dependency error")
+	}
+}
+
+func TestGetInstancePropertiesRejectsOptions(t *testing.T) {
+	tests := []struct {
+		hint    CloudProviderHint
+		options map[string]string
+	}{
+		{hint: CloudProviderHintOKE, options: map[string]string{"oke.a": "1"}},
+		{hint: CloudProviderHintCKS, options: map[string]string{"cks.a": "1"}},
+		{hint: CloudProviderHintNone, options: map[string]string{"oke.a": "1"}},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.hint), func(t *testing.T) {
+			_, err := GetInstanceProperties(context.Background(), tt.hint, "", Dependencies{ProviderOptions: tt.options})
+			if !errors.Is(err, ErrInvalidProviderOptions) {
+				t.Fatalf("GetInstanceProperties() error = %v, want ErrInvalidProviderOptions", err)
+			}
+		})
 	}
 }
