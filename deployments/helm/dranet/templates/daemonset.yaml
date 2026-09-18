@@ -75,6 +75,9 @@ spec:
             {{- if .Values.args.cloudProviderHint }}
             - --cloud-provider-hint={{ .Values.args.cloudProviderHint }}
             {{- end }}
+            {{- if (hasKey .Values.args "cloudProviderOptions") }}
+            - {{ printf "--cloud-provider-options=%s" .Values.args.cloudProviderOptions | quote }}
+            {{- end }}
             {{- if (hasKey .Values.args "profileProvider") }}
             - {{ printf "--profile-provider=%s" .Values.args.profileProvider | quote }}
             {{- end }}

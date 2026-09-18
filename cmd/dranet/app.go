@@ -55,19 +55,20 @@ const (
 )
 
 var (
-	hostnameOverride  string
-	kubeconfig        string
-	bindAddress       string
-	celExpression     string
-	dbPath            string
-	minPollInterval   time.Duration
-	maxPollInterval   time.Duration
-	pollBurst         int
-	moveIBInterfaces  bool
-	cloudProviderHint string
-	profileProvider   string
-	webhookURL        string
-	featureGates      string
+	hostnameOverride     string
+	kubeconfig           string
+	bindAddress          string
+	celExpression        string
+	dbPath               string
+	minPollInterval      time.Duration
+	maxPollInterval      time.Duration
+	pollBurst            int
+	moveIBInterfaces     bool
+	cloudProviderHint    string
+	profileProvider      string
+	webhookURL           string
+	featureGates         string
+	cloudProviderOptions string
 
 	kubeletRootDir string
 
@@ -89,6 +90,7 @@ func init() {
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
+	flag.StringVar(&cloudProviderOptions, "cloud-provider-options", "", "Comma-separated <provider>.<option>=<value> pairs for the active cloud provider. Values cannot contain commas. The options of a provider apply only when that provider runs. Values must not contain secrets; flags are logged.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -104,6 +106,13 @@ func main() {
 		if err := features.DefaultMutableFeatureGate.Set(featureGates); err != nil {
 			klog.Fatalf("Failed to set feature gates: %v", err)
 		}
+	}
+
+	// Parse before creating the Kubernetes client, so an invalid option fails
+	// even outside a cluster, where the client would fail first.
+	cloudOptions, optionsErr := discovery.ParseProviderOptions(cloudProviderOptions)
+	if optionsErr != nil {
+		klog.Fatalf("invalid --cloud-provider-options: %v", optionsErr)
 	}
 
 	printVersion()
@@ -204,6 +213,7 @@ func main() {
 			NodeClient:        clientset.CoreV1().Nodes(),
 			NodeName:          nodeName,
 			ReservedAddresses: store.GetInUseSubinterfaceIPs(),
+			ProviderOptions:   cloudOptions,
 		},
 	}
 	cloudInst, profProv, err := setupProviders(ctx, providerOpts)

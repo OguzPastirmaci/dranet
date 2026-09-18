@@ -52,6 +52,8 @@ type Dependencies struct {
 	NodeName   string
 	// ReservedAddresses seeds a provider with addresses already in use on the node.
 	ReservedAddresses []string
+	// ProviderOptions holds the checked --cloud-provider-options.
+	ProviderOptions ProviderOptions
 }
 
 type cloudProviderProbe struct {

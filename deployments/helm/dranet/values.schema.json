@@ -103,6 +103,10 @@
           "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "CKS", "webhook", "NONE"],
           "description": "Hint for the cloud provider plugin; auto-detected if unset"
         },
+        "cloudProviderOptions": {
+          "type": "string",
+          "description": "Comma-separated <provider>.<option>=<value> pairs; the options of a provider apply only when that provider runs"
+        },
         "profileProvider": {
           "type": "string",
           "enum": ["cloud", "webhook", "none"],

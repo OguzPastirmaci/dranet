@@ -28,6 +28,7 @@ args: {}
 #  inventoryPollBurst: 5
 #  moveIBInterfaces: true
 #  cloudProviderHint: ""
+#  cloudProviderOptions: ""
 #  profileProvider: "cloud"
 #  webhookURL: ""
 #  featureGates: ""

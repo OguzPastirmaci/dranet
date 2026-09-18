@@ -44,6 +44,7 @@ The following table lists the configurable parameters and their default values:
 | `args.inventoryPollBurst` | Number of inventory polls that can be run in a burst | binary default: `5` |
 | `args.moveIBInterfaces` | If true, InfiniBand (IPoIB) interfaces are moved into the pod network namespace | binary default: `true` |
 | `args.cloudProviderHint` | Hint for the cloud provider plugin (`GCE`, `AZURE`, `OKE`, `AWS`, `ALIBABA`, `CKS`, `webhook`, `NONE`); auto-detected if unset | binary default: `""` |
+| `args.cloudProviderOptions` | Comma-separated `<provider>.<option>=<value>` pairs; see [Cloud provider options](#cloud-provider-options) | binary default: `""` |
 | `args.profileProvider` | Provider for user profile configuration (`cloud`, `webhook`, `none`) | binary default: `cloud` |
 | `args.webhookURL` | HTTP, HTTPS, or Unix socket URL; required when either provider uses `webhook` | binary default: `""` |
 | `args.featureGates` | Comma-separated feature gate settings in `key=value` format | binary default: `""` |
@@ -85,3 +86,14 @@ Parameters can be set at install time using `--set` or a custom values file:
 helm upgrade --install dranet ./deployments/helm/dranet -n kube-system --set logVerbosity=6
 helm upgrade --install dranet ./deployments/helm/dranet -n kube-system -f my-values.yaml
 ```
+
+## Cloud provider options
+
+`args.cloudProviderOptions` sets `--cloud-provider-options`, a comma-separated
+list of `<provider>.<option>=<value>` pairs. The options of a provider apply
+only when that provider runs. Values cannot contain commas. Values must not
+contain secrets because DRANET logs its command-line flags. With `--set`,
+escape each comma between two pairs as `\,`.
+
+No options are currently defined. Providers document their keys when they
+add them.
