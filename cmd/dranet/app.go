@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -55,19 +57,20 @@ const (
 )
 
 var (
-	hostnameOverride  string
-	kubeconfig        string
-	bindAddress       string
-	celExpression     string
-	dbPath            string
-	minPollInterval   time.Duration
-	maxPollInterval   time.Duration
-	pollBurst         int
-	moveIBInterfaces  bool
-	cloudProviderHint string
-	profileProvider   string
-	webhookURL        string
-	featureGates      string
+	hostnameOverride     string
+	kubeconfig           string
+	bindAddress          string
+	celExpression        string
+	dbPath               string
+	minPollInterval      time.Duration
+	maxPollInterval      time.Duration
+	pollBurst            int
+	moveIBInterfaces     bool
+	cloudProviderHint    string
+	profileProvider      string
+	webhookURL           string
+	featureGates         string
+	cloudProviderOptions string
 
 	kubeletRootDir string
 
@@ -89,6 +92,7 @@ func init() {
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
+	flag.StringVar(&cloudProviderOptions, "cloud-provider-options", "", "Comma-separated <provider>.<option>=<value> pairs for the active cloud provider. Values cannot contain commas. Requires the matching --cloud-provider-hint, for example OKE for oke.* options. Values must not contain secrets; flags are logged.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -104,6 +108,13 @@ func main() {
 		if err := features.DefaultMutableFeatureGate.Set(featureGates); err != nil {
 			klog.Fatalf("Failed to set feature gates: %v", err)
 		}
+	}
+
+	// Parse before creating the Kubernetes client, so a malformed option fails
+	// even outside a cluster, where the client would fail first.
+	cloudOptions, optionsErr := parseCloudProviderOptions(cloudProviderOptions)
+	if optionsErr != nil {
+		klog.Fatalf("invalid --cloud-provider-options: %v", optionsErr)
 	}
 
 	printVersion()
@@ -204,6 +215,7 @@ func main() {
 			NodeClient:        clientset.CoreV1().Nodes(),
 			NodeName:          nodeName,
 			ReservedAddresses: store.GetInUseSubinterfaceIPs(),
+			ProviderOptions:   cloudOptions,
 		},
 	}
 	cloudInst, profProv, err := setupProviders(ctx, providerOpts)
@@ -271,6 +283,20 @@ type providerOptions struct {
 }
 
 func setupProviders(ctx context.Context, opts providerOptions) (cloudprovider.CloudInstance, cloudprovider.ProfileProvider, error) {
+	// Static checks only: configuration validity must not depend on
+	// discovery, whose IMDS probes can fail temporarily at boot. The hint
+	// must equal the mapped value exactly, so "", "oke", and NONE fail.
+	for key := range opts.dependencies.ProviderOptions {
+		namespace, _, _ := strings.Cut(key, ".")
+		want, ok := optionNamespaces[namespace]
+		if !ok {
+			return nil, nil, fmt.Errorf("cloud provider option %q has an unsupported namespace", key)
+		}
+		if discovery.CloudProviderHint(opts.cloudProviderHint) != want {
+			return nil, nil, fmt.Errorf("cloud provider option %q requires --cloud-provider-hint=%s, got %q", key, want, opts.cloudProviderHint)
+		}
+	}
+
 	var cloudInst cloudprovider.CloudInstance
 	var profProv cloudprovider.ProfileProvider
 	var err error
@@ -286,6 +312,9 @@ func setupProviders(ctx context.Context, opts providerOptions) (cloudprovider.Cl
 	// Setup the Underlay (Hardware Discovery / Cloud Instance Info)
 	cloudInst, err = discovery.GetInstanceProperties(ctx, hint, opts.webhookURL, opts.dependencies)
 	if err != nil {
+		if errors.Is(err, discovery.ErrInvalidProviderOptions) {
+			return nil, nil, err
+		}
 		klog.Infof("failed to initialize cloud provider %q: %v", hint, err)
 		cloudInst = nil
 	}

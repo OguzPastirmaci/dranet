@@ -37,6 +37,7 @@ The following table lists the configurable parameters and their default values:
 | `serviceAccount.annotations` | Annotations to add to the service account | `{}` |
 | `extraVolumes` | Extra volumes, added after the built-in volumes | `[]` |
 | `extraVolumeMounts` | Extra volume mounts for the dranet container, added after the built-in mounts | `[]` |
+| `cloudProviderOptions` | Provider-specific options as `<provider>.<option>: <value>` pairs; requires `args.cloudProviderHint` | `{}` |
 | `args.filter` | CEL expression to filter network interface attributes | see binary default |
 | `args.dbPath` | Persistent bbolt database path; set to `""` to use in-memory state | binary default: `/var/run/dranet/dranet.db` |
 | `args.inventoryMinPollInterval` | Minimum interval between two consecutive inventory polls | binary default: `2s` |
@@ -85,3 +86,14 @@ Parameters can be set at install time using `--set` or a custom values file:
 helm upgrade --install dranet ./deployments/helm/dranet -n kube-system --set logVerbosity=6
 helm upgrade --install dranet ./deployments/helm/dranet -n kube-system -f my-values.yaml
 ```
+
+## Cloud provider options
+
+`cloudProviderOptions` renders provider-specific options into
+`--cloud-provider-options` as comma-separated `<provider>.<option>=<value>`
+pairs. Setting any option requires `args.cloudProviderHint`. Values must
+not contain secrets because DRANET logs its command-line flags.
+Values cannot contain commas.
+
+No options are currently defined. Providers document their keys when they
+add them.

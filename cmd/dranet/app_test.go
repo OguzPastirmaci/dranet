@@ -19,8 +19,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -205,5 +207,49 @@ func TestSetupProvidersCKS(t *testing.T) {
 	}
 	if profileProvider != nil {
 		t.Fatalf("setupProviders() profile provider = %T, want nil", profileProvider)
+	}
+}
+
+func TestSetupProvidersRejectsBadOptions(t *testing.T) {
+	ctx := context.Background()
+	okeOption := map[string]string{"oke.child-ipv4-cidr": "10.192.0.0/15"}
+	cksOption := map[string]string{"cks.a": "1"}
+
+	tests := []struct {
+		name         string
+		hint         string
+		options      map[string]string
+		wantContains string
+		wantSentinel bool
+	}{
+		{name: "options require an explicit hint", hint: "", options: okeOption, wantContains: `requires --cloud-provider-hint=OKE, got ""`},
+		{name: "options reject a lowercase hint", hint: "oke", options: okeOption, wantContains: `requires --cloud-provider-hint=OKE, got "oke"`},
+		{name: "options must match the hint namespace", hint: "GCE", options: okeOption, wantContains: `requires --cloud-provider-hint=OKE, got "GCE"`},
+		{name: "no provider defines options yet", hint: "OKE", options: okeOption, wantSentinel: true},
+		{name: "options reject the NONE hint", hint: "NONE", options: okeOption, wantContains: `requires --cloud-provider-hint=OKE, got "NONE"`},
+		{name: "CKS options must match the hint namespace", hint: "CKS", options: okeOption, wantContains: `requires --cloud-provider-hint=OKE, got "CKS"`},
+		{name: "CKS defines no options yet", hint: "CKS", options: cksOption, wantSentinel: true},
+		{name: "webhook defines no options yet", hint: "webhook", options: map[string]string{"webhook.a": "1"}, wantSentinel: true},
+		// Parsing rejects these keys first; setupProviders must not rely on it.
+		{name: "options reject an unsupported namespace", hint: "", options: map[string]string{"foo.a": "1"}, wantContains: "unsupported namespace"},
+		{name: "options reject an uppercase namespace", hint: "OKE", options: map[string]string{"OKE.a": "1"}, wantContains: "unsupported namespace"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := setupProviders(ctx, providerOptions{
+				cloudProviderHint: tt.hint,
+				profileProvider:   "cloud",
+				dependencies:      discovery.Dependencies{ProviderOptions: tt.options},
+			})
+			if err == nil {
+				t.Fatalf("setupProviders(hint=%q, options=%v) returned no error", tt.hint, tt.options)
+			}
+			if tt.wantContains != "" && !strings.Contains(err.Error(), tt.wantContains) {
+				t.Errorf("setupProviders() error = %q, want it to contain %q", err.Error(), tt.wantContains)
+			}
+			if tt.wantSentinel && !errors.Is(err, discovery.ErrInvalidProviderOptions) {
+				t.Errorf("setupProviders() error = %v, want errors.Is(err, discovery.ErrInvalidProviderOptions)", err)
+			}
+		})
 	}
 }

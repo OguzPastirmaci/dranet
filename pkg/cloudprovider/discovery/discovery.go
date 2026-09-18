@@ -18,6 +18,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"cloud.google.com/go/compute/metadata"
@@ -45,6 +46,10 @@ const (
 	CloudProviderHintNone    CloudProviderHint = "NONE"
 )
 
+// ErrInvalidProviderOptions marks configuration errors that must stop DRANET
+// instead of falling back to a nil cloud provider.
+var ErrInvalidProviderOptions = errors.New("invalid cloud provider options")
+
 // Dependencies carries host- and runtime-provided inputs that providers require
 // but cannot obtain from conventional instance metadata service.
 type Dependencies struct {
@@ -52,6 +57,8 @@ type Dependencies struct {
 	NodeName   string
 	// ReservedAddresses seeds a provider with addresses already in use on the node.
 	ReservedAddresses []string
+	// ProviderOptions holds the parsed --cloud-provider-options pairs.
+	ProviderOptions map[string]string
 }
 
 type cloudProviderProbe struct {
@@ -93,6 +100,11 @@ func detectCloudProvider(probes []cloudProviderProbe) CloudProviderHint {
 // GetInstanceProperties initializes the specified cloud provider using additional
 // Kubernetes-local provider inputs when available.
 func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string, dependencies Dependencies) (cloudprovider.CloudInstance, error) {
+	// No provider defines options yet. A provider that adds one replaces
+	// this rejection with its own validation and constructor wiring.
+	if len(dependencies.ProviderOptions) > 0 {
+		return nil, fmt.Errorf("%w: provider %s defines no options", ErrInvalidProviderOptions, hint)
+	}
 	switch hint {
 	case CloudProviderHintGCE:
 		return gce.GetInstance(ctx, gce.WithReservedAddresses(dependencies.ReservedAddresses))
