@@ -211,7 +211,10 @@ func TestSetupProvidersCKS(t *testing.T) {
 }
 
 func TestSetupProvidersRejectsBadOptions(t *testing.T) {
-	ctx := context.Background()
+	// Every row must fail before a provider starts. The cancelled context
+	// makes a row that reaches a provider fail at once, not after an IMDS wait.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	okeOption := map[string]string{"oke.child-ipv4-cidr": "10.192.0.0/15"}
 	cksOption := map[string]string{"cks.a": "1"}
 
@@ -225,10 +228,11 @@ func TestSetupProvidersRejectsBadOptions(t *testing.T) {
 		{name: "options require an explicit hint", hint: "", options: okeOption, wantContains: "require an explicit"},
 		{name: "options reject a non-canonical hint", hint: "oke", options: okeOption, wantContains: "canonical"},
 		{name: "options must match the hint namespace", hint: "GCE", options: okeOption, wantContains: "does not match"},
-		// The oke.* option only reaches discovery under hint "OKE" because
-		// strings.EqualFold accepts the case-insensitive match, so this case
-		// also proves the namespace match is case-insensitive.
-		{name: "no provider defines options yet", hint: "OKE", options: okeOption, wantSentinel: true},
+		// The oke.* options only reach discovery under hint "OKE" because
+		// strings.EqualFold accepts the case-insensitive match, so these cases
+		// also prove the namespace match is case-insensitive.
+		{name: "unknown OKE option stops the driver", hint: "OKE", options: map[string]string{"oke.unknown": "1"}, wantSentinel: true},
+		{name: "bad OKE child range stops the driver", hint: "OKE", options: map[string]string{"oke.child-ipv4-cidr": "10.192.0.0/33"}, wantSentinel: true},
 		{name: "options reject the NONE hint", hint: "NONE", options: okeOption, wantContains: "canonical"},
 		{name: "CKS options must match the hint namespace", hint: "CKS", options: okeOption, wantContains: "does not match"},
 		{name: "CKS defines no options yet", hint: "CKS", options: cksOption, wantSentinel: true},
@@ -250,5 +254,23 @@ func TestSetupProvidersRejectsBadOptions(t *testing.T) {
 				t.Errorf("setupProviders() error = %v, want errors.Is(err, discovery.ErrInvalidProviderOptions)", err)
 			}
 		})
+	}
+}
+
+// A valid option plus a failed provider start (cancelled context) keeps the
+// log-and-continue behavior: no error and no cloud instance.
+func TestSetupProvidersValidOKEOptionKeepsGoing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cloudInst, _, err := setupProviders(ctx, providerOptions{
+		cloudProviderHint: "OKE",
+		profileProvider:   "cloud",
+		dependencies:      discovery.Dependencies{ProviderOptions: map[string]string{"oke.child-ipv4-cidr": "10.192.0.0/14"}},
+	})
+	if err != nil {
+		t.Fatalf("setupProviders() error = %v, want nil", err)
+	}
+	if cloudInst != nil {
+		t.Fatalf("setupProviders() cloud instance = %T, want nil after a failed provider start", cloudInst)
 	}
 }

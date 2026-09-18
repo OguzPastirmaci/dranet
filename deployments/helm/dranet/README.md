@@ -95,5 +95,4 @@ pairs. Setting any option requires `args.cloudProviderHint`. Values must
 not contain secrets because DRANET logs its command-line flags.
 Values cannot contain commas.
 
-No options are currently defined. Providers document their keys when they
-add them.
+Each provider documents its keys on its page of the user documentation.

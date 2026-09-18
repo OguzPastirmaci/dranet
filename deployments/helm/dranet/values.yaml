@@ -34,8 +34,8 @@ args: {}
 
 # Provider-specific options rendered into --cloud-provider-options as
 # comma-separated <provider>.<option>=<value> pairs in sorted key order.
-# Requires args.cloudProviderHint. No options are currently defined;
-# providers document their keys when they add them.
+# Requires args.cloudProviderHint. Each provider documents its keys on its
+# page of the user documentation.
 # Values must not contain secrets; DRANET logs its command-line flags.
 # Values cannot contain commas.
 cloudProviderOptions: {}

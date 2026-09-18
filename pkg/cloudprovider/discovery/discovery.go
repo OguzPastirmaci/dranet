@@ -50,6 +50,9 @@ const (
 // instead of falling back to a nil cloud provider.
 var ErrInvalidProviderOptions = errors.New("invalid cloud provider options")
 
+// okeGetInstance is replaced in tests, which have no IMDS.
+var okeGetInstance = oke.GetInstance
+
 // Dependencies carries host- and runtime-provided inputs that providers require
 // but cannot obtain from conventional instance metadata service.
 type Dependencies struct {
@@ -100,9 +103,9 @@ func detectCloudProvider(probes []cloudProviderProbe) CloudProviderHint {
 // GetInstanceProperties initializes the specified cloud provider using additional
 // Kubernetes-local provider inputs when available.
 func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string, dependencies Dependencies) (cloudprovider.CloudInstance, error) {
-	// No provider defines options yet. A provider that adds one replaces
-	// this rejection with its own validation and constructor wiring.
-	if len(dependencies.ProviderOptions) > 0 {
+	// Only OKE defines options and checks its own keys below. A provider that
+	// adds one joins it with its own validation and constructor wiring.
+	if len(dependencies.ProviderOptions) > 0 && hint != CloudProviderHintOKE {
 		return nil, fmt.Errorf("%w: provider %s defines no options", ErrInvalidProviderOptions, hint)
 	}
 	switch hint {
@@ -113,7 +116,13 @@ func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookU
 	case CloudProviderHintAzure:
 		return azure.GetInstance(ctx)
 	case CloudProviderHintOKE:
-		return oke.GetInstance(ctx)
+		// The options are checked before the provider starts, so a bad
+		// value stops DRANET even when IMDS is slow.
+		okeOptions, err := oke.ParseOptions(dependencies.ProviderOptions)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidProviderOptions, err)
+		}
+		return okeGetInstance(ctx, okeOptions...)
 	case CloudProviderHintAlibaba:
 		return alibaba.GetInstance(ctx, alibaba.WithReservedAddresses(dependencies.ReservedAddresses))
 	case CloudProviderHintCKS:
