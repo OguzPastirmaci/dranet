@@ -22,6 +22,7 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/alibaba"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/aws"
@@ -95,6 +96,11 @@ func detectCloudProvider(probes []cloudProviderProbe) CloudProviderHint {
 // GetInstanceProperties initializes the specified cloud provider using additional
 // Kubernetes-local provider inputs when available.
 func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookURL string, dependencies Dependencies) (cloudprovider.CloudInstance, error) {
+	// Without a hint, discovery can pick another provider or none. The options
+	// of a provider that does not run have nothing to configure.
+	if hint != CloudProviderHintOKE && len(dependencies.ProviderOptions.OKE) > 0 {
+		klog.Warningf("Ignoring the oke.* cloud provider options, because the cloud provider is %q", hint)
+	}
 	switch hint {
 	case CloudProviderHintGCE:
 		return gce.GetInstance(ctx, gce.WithReservedAddresses(dependencies.ReservedAddresses))
@@ -103,7 +109,7 @@ func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookU
 	case CloudProviderHintAzure:
 		return azure.GetInstance(ctx)
 	case CloudProviderHintOKE:
-		return oke.GetInstance(ctx)
+		return oke.GetInstance(ctx, dependencies.ProviderOptions.OKE...)
 	case CloudProviderHintAlibaba:
 		return alibaba.GetInstance(ctx, alibaba.WithReservedAddresses(dependencies.ReservedAddresses))
 	case CloudProviderHintCKS:

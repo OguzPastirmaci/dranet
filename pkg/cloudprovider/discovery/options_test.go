@@ -67,22 +67,28 @@ func TestParseProviderOptions(t *testing.T) {
 	tests := []struct {
 		name    string
 		value   string
+		wantOKE int
 		wantErr string
 	}{
 		{name: "no options"},
 		{name: "only commas", value: ",,"},
 		{name: "a syntax error stops parsing", value: "oke.a", wantErr: "not a key=value pair"},
-		{name: "OKE defines no options yet", value: "oke.a=1", wantErr: `provider oke defines no options, got "oke.a"`},
+		{name: "valid OKE option", value: "oke.rdma-child-ipv4-cidr=10.192.0.0/14", wantOKE: 1},
+		{name: "bad OKE value", value: "oke.rdma-child-ipv4-cidr=10.192.0.0/33", wantErr: "option oke.rdma-child-ipv4-cidr"},
+		{name: "unknown OKE key", value: "oke.unknown=1", wantErr: `unknown OKE option "oke.unknown"`},
 		{name: "CKS defines no options yet", value: "cks.a=1", wantErr: `provider cks defines no options, got "cks.a"`},
 		{name: "a typo in the provider fails", value: "okee.a=1", wantErr: `provider okee defines no options, got "okee.a"`},
-		{name: "the error names the first key", value: "oke.b=1,cks.a=1", wantErr: `got "cks.a"`},
+		{name: "a valid OKE option does not hide another provider", value: "oke.rdma-child-ipv4-cidr=10.192.0.0/14,gce.a=1", wantErr: `provider gce defines no options, got "gce.a"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := ParseProviderOptions(tt.value)
+			got, err := ParseProviderOptions(tt.value)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("ParseProviderOptions(%q) error = %v, want nil", tt.value, err)
+				}
+				if len(got.OKE) != tt.wantOKE {
+					t.Errorf("ParseProviderOptions(%q) returned %d OKE options, want %d", tt.value, len(got.OKE), tt.wantOKE)
 				}
 				return
 			}

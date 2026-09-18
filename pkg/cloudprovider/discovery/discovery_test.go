@@ -87,3 +87,16 @@ func TestGetInstancePropertiesCKSRequiresDependencies(t *testing.T) {
 		t.Fatal("GetInstanceProperties() error = nil, want missing Kubernetes dependency error")
 	}
 }
+
+// Without a hint, discovery can pick a provider other than OKE. Its oke.*
+// options then configure nothing, and DRANET keeps running.
+func TestGetInstancePropertiesIgnoresOptionsOfAnotherProvider(t *testing.T) {
+	options, err := ParseProviderOptions("oke.rdma-child-ipv4-cidr=10.192.0.0/14")
+	if err != nil {
+		t.Fatalf("ParseProviderOptions() error = %v", err)
+	}
+	instance, err := GetInstanceProperties(context.Background(), CloudProviderHintNone, "", Dependencies{ProviderOptions: options})
+	if err != nil || instance != nil {
+		t.Errorf("GetInstanceProperties() = %v, %v, want nil, nil", instance, err)
+	}
+}

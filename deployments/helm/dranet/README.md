@@ -95,5 +95,4 @@ only when that provider runs. Values cannot contain commas. Values must not
 contain secrets because DRANET logs its command-line flags. With `--set`,
 escape each comma between two pairs as `\,`.
 
-No options are currently defined. Providers document their keys when they
-add them.
+Each provider documents its keys on its page of the user documentation.

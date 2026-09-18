@@ -21,10 +21,14 @@ import (
 	"maps"
 	"slices"
 	"strings"
+
+	"sigs.k8s.io/dranet/pkg/cloudprovider/oke"
 )
 
 // ProviderOptions holds the checked --cloud-provider-options of each provider.
-type ProviderOptions struct{}
+type ProviderOptions struct {
+	OKE []oke.Option
+}
 
 // ParseProviderOptions parses comma-separated <provider>.<option>=<value>
 // pairs and checks them with the rules of their provider. The checks need no
@@ -34,12 +38,21 @@ func ParseProviderOptions(value string) (ProviderOptions, error) {
 	if err != nil {
 		return ProviderOptions{}, err
 	}
-	// No provider defines options yet.
-	if keys := slices.Sorted(maps.Keys(options)); len(keys) > 0 {
-		provider, _, _ := strings.Cut(keys[0], ".")
-		return ProviderOptions{}, fmt.Errorf("provider %s defines no options, got %q", provider, keys[0])
+	okeOptions := map[string]string{}
+	for _, key := range slices.Sorted(maps.Keys(options)) {
+		// A provider that defines options adds a case here.
+		switch provider, _, _ := strings.Cut(key, "."); provider {
+		case "oke":
+			okeOptions[key] = options[key]
+		default:
+			return ProviderOptions{}, fmt.Errorf("provider %s defines no options, got %q", provider, key)
+		}
 	}
-	return ProviderOptions{}, nil
+	okeOpts, err := oke.ParseOptions(okeOptions)
+	if err != nil {
+		return ProviderOptions{}, err
+	}
+	return ProviderOptions{OKE: okeOpts}, nil
 }
 
 // splitProviderOptions splits the flag value into pairs. As with

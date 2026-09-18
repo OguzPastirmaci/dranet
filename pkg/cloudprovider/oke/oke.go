@@ -23,11 +23,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"math/bits"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -61,9 +64,6 @@ const (
 	AttrOKERDMAFabricIPv6   = OKEAttrPrefix + "/" + "rdmaFabricIpv6"
 	AttrOKERDMAFabricPlanes = OKEAttrPrefix + "/" + "rdmaFabricPlanes"
 
-	// imdsEndpoint is the Oracle Cloud Instance Metadata Service endpoint.
-	imdsEndpoint = "http://169.254.169.254/opc/v2"
-
 	imdsInitialRetryInterval = 1 * time.Second
 	imdsInitialWait          = 15 * time.Second
 	imdsRefreshInterval      = 5 * time.Minute
@@ -87,10 +87,12 @@ const (
 	// okeRDMAParentIPv4CIDR is the OCA RDMA network when rdma_network.json
 	// is not mounted.
 	okeRDMAParentIPv4CIDR = "10.224.0.0/12"
-	// okeRDMAChildIPv4CIDR holds one child block per parent at the parent's offset.
-	// A /12 holds all 16 RDMA NICs of a /16 subnet, the largest OCI subnet. It
-	// avoids the parent 10.224.0.0/12 and the OKE pod CIDR 10.240.0.0/12.
+	// okeRDMAChildIPv4CIDR is the default child range, one child block per parent
+	// at the parent's offset. A /12 holds all 16 RDMA NICs of a /16 subnet, and
+	// it avoids the parent 10.224.0.0/12 and the OKE pod CIDR 10.240.0.0/12.
 	okeRDMAChildIPv4CIDR = "10.208.0.0/12"
+	// optionRDMAChildIPv4CIDR is the cloud provider option that replaces it.
+	optionRDMAChildIPv4CIDR = "oke.rdma-child-ipv4-cidr"
 	// okeChildrenPerNIC is the size of the block of child addresses that each
 	// RDMA NIC owns. The child is the first address of the block.
 	okeChildrenPerNIC = 1
@@ -105,6 +107,8 @@ const (
 
 // Tests point these at a temporary directory or a fake.
 var (
+	// imdsEndpoint is the Oracle Cloud Instance Metadata Service endpoint.
+	imdsEndpoint        = "http://169.254.169.254/opc/v2"
 	sysClassNet         = "/sys/class/net"
 	sysfsPCIDevices     = "/sys/bus/pci/devices"
 	procSysNetIPv4Conf  = "/proc/sys/net/ipv4/conf"
@@ -118,8 +122,6 @@ var (
 		return iface.Addrs()
 	}
 )
-
-var okeRDMAChildIPv4Range = netip.MustParsePrefix(okeRDMAChildIPv4CIDR)
 
 // imdsHostRDMATopologyData contains the RDMA topology fields from the
 // /opc/v2/host/ response. IMDS populates them only for instances in a
@@ -225,23 +227,76 @@ type OKEInstance struct {
 	// whose RDMA NICs do not carry the rdmaN name.
 	addressFallback bool
 	// layoutValidated is set once the classic host layout check has passed.
-	layoutValidated      atomic.Bool
+	layoutValidated atomic.Bool
+	// childIPv4Range holds the child addresses. It is set once in
+	// newOKEInstance, before any other goroutine sees the instance.
+	childIPv4Range       netip.Prefix
 	initialRetryInterval time.Duration
 	initialWait          time.Duration
 	refreshInterval      time.Duration
 }
 
-func newOKEInstance(metadata *okeMetadata, fetch metadataFetcher) *OKEInstance {
+// Option configures an OKEInstance at construction time; see GetInstance.
+type Option func(*OKEInstance)
+
+func withChildIPv4Range(prefix netip.Prefix) Option {
+	return func(o *OKEInstance) { o.childIPv4Range = prefix }
+}
+
+// ParseOptions checks the oke.* cloud provider options and returns them as
+// instance options. An unknown key is an error.
+func ParseOptions(options map[string]string) ([]Option, error) {
+	var opts []Option
+	// Sorted, so the same options always give the same error.
+	for _, key := range slices.Sorted(maps.Keys(options)) {
+		value := options[key]
+		switch key {
+		case optionRDMAChildIPv4CIDR:
+			prefix, err := netip.ParsePrefix(value)
+			if err != nil {
+				return nil, fmt.Errorf("option %s: %w", key, err)
+			}
+			if err := validateChildIPv4Range(prefix); err != nil {
+				return nil, fmt.Errorf("option %s: %w", key, err)
+			}
+			opts = append(opts, withChildIPv4Range(prefix))
+		default:
+			return nil, fmt.Errorf("unknown OKE option %q", key)
+		}
+	}
+	return opts, nil
+}
+
+// validateChildIPv4Range holds the rules that need no node data. The checks
+// against the OCA network and the primary VNIC subnet run for each claim.
+func validateChildIPv4Range(prefix netip.Prefix) error {
+	if !prefix.IsValid() || !prefix.Addr().Is4() {
+		return fmt.Errorf("child range %s is not an IPv4 prefix", prefix)
+	}
+	if prefix != prefix.Masked() {
+		return fmt.Errorf("child range %s is not in masked form, use %s", prefix, prefix.Masked())
+	}
+	if prefix.Bits() < 8 || prefix.Bits() > 30 {
+		return fmt.Errorf("child range %s must have a prefix length from 8 to 30", prefix)
+	}
+	return nil
+}
+
+func newOKEInstance(metadata *okeMetadata, fetch metadataFetcher, opts ...Option) *OKEInstance {
 	instance := &OKEInstance{
 		fetchMetadata:        fetch,
 		ocaConfig:            defaultOCARDMAConfig(),
 		addressFallback:      true,
+		childIPv4Range:       netip.MustParsePrefix(okeRDMAChildIPv4CIDR),
 		initialRetryInterval: imdsInitialRetryInterval,
 		initialWait:          imdsInitialWait,
 		refreshInterval:      imdsRefreshInterval,
 	}
 	if metadata != nil {
 		instance.metadata.Store(metadata)
+	}
+	for _, opt := range opts {
+		opt(instance)
 	}
 	return instance
 }
@@ -386,7 +441,8 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 	if err != nil {
 		return nil, err
 	}
-	parentAddr, childAddr, err := deriveRDMAIPv4(vnic, index, parentRange)
+	childRange := o.childIPv4Range
+	parentAddr, childAddr, err := deriveRDMAIPv4(vnic, index, parentRange, childRange)
 	if err != nil {
 		return nil, fmt.Errorf("could not derive the OKE child address for %s: %w", ifName, err)
 	}
@@ -405,7 +461,7 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 	result := &apis.NetworkConfig{
 		Interface: apis.InterfaceConfig{
 			Type:        apis.InterfaceTypeIPVLAN,
-			Addresses:   []string{netip.PrefixFrom(childAddr, okeRDMAChildIPv4Range.Bits()).String()},
+			Addresses:   []string{netip.PrefixFrom(childAddr, childRange.Bits()).String()},
 			ARPIgnore:   arpIgnore,
 			ARPAnnounce: arpAnnounce,
 		},
@@ -416,7 +472,7 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 	}
 	table := okeRDMASBRTableBase + index
 	result.Routes = []apis.RouteConfig{{
-		Destination: okeRDMAChildIPv4CIDR,
+		Destination: childRange.String(),
 		Source:      childAddr.String(),
 		Scope:       unix.RT_SCOPE_LINK,
 		Table:       table,
@@ -794,10 +850,10 @@ func (o *OKEInstance) refreshLoop(ctx context.Context) {
 // from IMDS. It returns after the first successful host read or after the
 // startup window. It keeps refreshing the metadata in the background until ctx
 // ends.
-func GetInstance(ctx context.Context) (cloudprovider.CloudInstance, error) {
+func GetInstance(ctx context.Context, opts ...Option) (cloudprovider.CloudInstance, error) {
 	// A dedicated client, so the per-request timeout does not affect other callers.
 	client := &http.Client{Timeout: imdsRequestTimeout}
-	instance, err := newOKEInstance(nil, nil).start(ctx, client, imdsEndpoint)
+	instance, err := newOKEInstance(nil, nil, opts...).start(ctx, client, imdsEndpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,7 +1118,7 @@ func deriveOCAParentIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Pref
 
 // deriveRDMAIPv4 computes the OCA parent and the Dranet child address of one
 // RDMA NIC. The child keeps the parent offset inside the child range.
-func deriveRDMAIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Prefix) (netip.Addr, netip.Addr, error) {
+func deriveRDMAIPv4(vnic *primaryVNIC, nicIndex int, parentRange, childRange netip.Prefix) (netip.Addr, netip.Addr, error) {
 	// An index above the largest shape would leave tables 100 to 115 and could
 	// reach a reserved table. It runs first, so every such index gets this error.
 	if nicIndex >= okeMaxIPv4RDMANics {
@@ -1072,7 +1128,10 @@ func deriveRDMAIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Prefix) (
 	if err != nil {
 		return netip.Addr{}, netip.Addr{}, err
 	}
-	childRange := okeRDMAChildIPv4Range
+	// The address math below needs a masked IPv4 range.
+	if err := validateChildIPv4Range(childRange); err != nil {
+		return netip.Addr{}, netip.Addr{}, err
+	}
 	if parentRange.Overlaps(childRange) {
 		return netip.Addr{}, netip.Addr{}, fmt.Errorf("OCA RDMA network %s overlaps the Dranet child range %s", parentRange, childRange)
 	}
@@ -1080,9 +1139,19 @@ func deriveRDMAIPv4(vnic *primaryVNIC, nicIndex int, parentRange netip.Prefix) (
 	if vnic.Subnet.Overlaps(childRange) {
 		return netip.Addr{}, netip.Addr{}, fmt.Errorf("primary VNIC subnet %s overlaps the Dranet child range %s", vnic.Subnet, childRange)
 	}
+	// A smaller range cannot hold every host position of the subnet.
+	if childRange.Bits() > vnic.Subnet.Bits() {
+		return netip.Addr{}, netip.Addr{}, fmt.Errorf("the child range %s is smaller than the primary VNIC subnet %s", childRange, vnic.Subnet)
+	}
 	start := offset * okeChildrenPerNIC
 	if start+okeChildrenPerNIC > uint64(1)<<(32-childRange.Bits()) {
-		return netip.Addr{}, netip.Addr{}, fmt.Errorf("RDMA NIC index %d with a /%d primary VNIC subnet is outside the child range %s", nicIndex, vnic.Subnet.Bits(), childRange)
+		hint := ""
+		// All RDMA NIC indexes need bits.Len(okeMaxIPv4RDMANics-1) more bits than
+		// the subnet: 4 for 16 indexes.
+		if length := vnic.Subnet.Bits() - bits.Len(okeMaxIPv4RDMANics-1); length >= 8 {
+			hint = fmt.Sprintf("; a /%d child range holds all %d RDMA NIC indexes of a /%d subnet", length, okeMaxIPv4RDMANics, vnic.Subnet.Bits())
+		}
+		return netip.Addr{}, netip.Addr{}, fmt.Errorf("RDMA NIC index %d with a /%d primary VNIC subnet is outside the child range %s%s", nicIndex, vnic.Subnet.Bits(), childRange, hint)
 	}
 	child := uint32ToIPv4(ipv4ToUint32(childRange.Addr()) + uint32(start))
 	return parent, child, nil
