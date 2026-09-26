@@ -19,6 +19,7 @@ package discovery
 import (
 	"context"
 	"fmt"
+	"net/netip"
 
 	"cloud.google.com/go/compute/metadata"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -52,7 +53,13 @@ type Dependencies struct {
 	NodeName   string
 	// ReservedAddresses seeds a provider with addresses already in use on the node.
 	ReservedAddresses []string
+	// OKEChildIPv4Range is the parsed --oke-rdma-child-cidr value. The zero
+	// value keeps the OKE default range.
+	OKEChildIPv4Range netip.Prefix
 }
+
+// okeGetInstance is replaced in tests, which have no IMDS.
+var okeGetInstance = oke.GetInstance
 
 type cloudProviderProbe struct {
 	hint  CloudProviderHint
@@ -101,7 +108,11 @@ func GetInstanceProperties(ctx context.Context, hint CloudProviderHint, webhookU
 	case CloudProviderHintAzure:
 		return azure.GetInstance(ctx)
 	case CloudProviderHintOKE:
-		return oke.GetInstance(ctx)
+		var opts []oke.Option
+		if dependencies.OKEChildIPv4Range.IsValid() {
+			opts = append(opts, oke.WithChildIPv4Range(dependencies.OKEChildIPv4Range))
+		}
+		return okeGetInstance(ctx, opts...)
 	case CloudProviderHintAlibaba:
 		return alibaba.GetInstance(ctx, alibaba.WithReservedAddresses(dependencies.ReservedAddresses))
 	case CloudProviderHintCKS:

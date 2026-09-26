@@ -75,6 +75,9 @@ spec:
             {{- if .Values.args.cloudProviderHint }}
             - --cloud-provider-hint={{ .Values.args.cloudProviderHint }}
             {{- end }}
+            {{- if .Values.args.okeRDMAChildCIDR }}
+            - {{ printf "--oke-rdma-child-cidr=%s" .Values.args.okeRDMAChildCIDR | quote }}
+            {{- end }}
             {{- if (hasKey .Values.args "profileProvider") }}
             - {{ printf "--profile-provider=%s" .Values.args.profileProvider | quote }}
             {{- end }}

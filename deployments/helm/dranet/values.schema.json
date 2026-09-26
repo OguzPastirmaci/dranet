@@ -103,6 +103,11 @@
           "enum": ["GCE", "AZURE", "OKE", "AWS", "ALIBABA", "CKS", "webhook", "NONE"],
           "description": "Hint for the cloud provider plugin; auto-detected if unset"
         },
+        "okeRDMAChildCIDR": {
+          "type": "string",
+          "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$",
+          "description": "IPv4 range of the IPvlan child addresses of the OKE provider"
+        },
         "profileProvider": {
           "type": "string",
           "enum": ["cloud", "webhook", "none"],

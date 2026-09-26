@@ -28,6 +28,7 @@ args: {}
 #  inventoryPollBurst: 5
 #  moveIBInterfaces: true
 #  cloudProviderHint: ""
+#  okeRDMAChildCIDR: "10.208.0.0/12"
 #  profileProvider: "cloud"
 #  webhookURL: ""
 #  featureGates: ""

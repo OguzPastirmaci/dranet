@@ -44,6 +44,7 @@ The following table lists the configurable parameters and their default values:
 | `args.inventoryPollBurst` | Number of inventory polls that can be run in a burst | binary default: `5` |
 | `args.moveIBInterfaces` | If true, InfiniBand (IPoIB) interfaces are moved into the pod network namespace | binary default: `true` |
 | `args.cloudProviderHint` | Hint for the cloud provider plugin (`GCE`, `AZURE`, `OKE`, `AWS`, `ALIBABA`, `CKS`, `webhook`, `NONE`); auto-detected if unset | binary default: `""` |
+| `args.okeRDMAChildCIDR` | IPv4 range of the OKE IPvlan child addresses; see the OKE user documentation | binary default: `10.208.0.0/12` |
 | `args.profileProvider` | Provider for user profile configuration (`cloud`, `webhook`, `none`) | binary default: `cloud` |
 | `args.webhookURL` | HTTP, HTTPS, or Unix socket URL; required when either provider uses `webhook` | binary default: `""` |
 | `args.featureGates` | Comma-separated feature gate settings in `key=value` format | binary default: `""` |

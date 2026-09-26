@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,6 +37,7 @@ import (
 	"golang.org/x/time/rate"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/discovery"
+	"sigs.k8s.io/dranet/pkg/cloudprovider/oke"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 	"sigs.k8s.io/dranet/pkg/driver"
 	"sigs.k8s.io/dranet/pkg/features"
@@ -68,6 +70,7 @@ var (
 	profileProvider   string
 	webhookURL        string
 	featureGates      string
+	okeRDMAChildCIDR  string
 
 	kubeletRootDir string
 
@@ -89,6 +92,7 @@ func init() {
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL for the webhook provider (required if using webhook for either provider)")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
+	flag.StringVar(&okeRDMAChildCIDR, "oke-rdma-child-cidr", "", "IPv4 range of the IPvlan child addresses that the OKE provider assigns. Empty keeps the OKE default. Use one value on every node of an RDMA network.")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -104,6 +108,17 @@ func main() {
 		if err := features.DefaultMutableFeatureGate.Set(featureGates); err != nil {
 			klog.Fatalf("Failed to set feature gates: %v", err)
 		}
+	}
+
+	// Parse before creating the Kubernetes client, so a bad value fails on every
+	// cloud. Only the OKE provider uses it.
+	var okeChildRange netip.Prefix
+	if okeRDMAChildCIDR != "" {
+		prefix, err := oke.ParseChildIPv4Range(okeRDMAChildCIDR)
+		if err != nil {
+			klog.Fatalf("invalid --oke-rdma-child-cidr: %v", err)
+		}
+		okeChildRange = prefix
 	}
 
 	printVersion()
@@ -204,6 +219,7 @@ func main() {
 			NodeClient:        clientset.CoreV1().Nodes(),
 			NodeName:          nodeName,
 			ReservedAddresses: store.GetInUseSubinterfaceIPs(),
+			OKEChildIPv4Range: okeChildRange,
 		},
 	}
 	cloudInst, profProv, err := setupProviders(ctx, providerOpts)
