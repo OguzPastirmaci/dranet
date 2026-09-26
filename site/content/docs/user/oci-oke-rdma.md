@@ -23,7 +23,7 @@ The profile needs these conditions:
 - The RDMA subsystem runs in shared network namespace mode (`netns_mode=1` for `ib_core`). In exclusive mode the claim fails with the message `use shared RDMA mode`.
 - All nodes that share one RDMA network use one primary VNIC subnet.
 - The child range is large enough for the primary VNIC subnet. See [The child range](#the-child-range).
-- No VCN subnet, pod CIDR, or service CIDR uses the child range. The provider checks the primary VNIC subnet and the OCA RDMA network only.
+- No VCN subnet, pod CIDR, or service CIDR uses the child range. For each claim, the provider checks the OCA RDMA network, every VNIC subnet of the node, the host routes inside the child range, and the Kubernetes service address. It cannot see the whole pod CIDR or service CIDR.
 
 The profile rejects `interface.type: Passthrough`, DHCP, unnumbered addressing, and addresses in the claim. A claim with its own `routes`, `rules`, or a VRF owns the routing.
 

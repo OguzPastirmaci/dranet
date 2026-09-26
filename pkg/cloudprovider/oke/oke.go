@@ -33,9 +33,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -43,6 +45,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	resourceapi "k8s.io/api/resource/v1"
+	"sigs.k8s.io/dranet/internal/nlwrap"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider"
 )
@@ -69,6 +72,9 @@ const (
 	imdsRefreshInterval      = 5 * time.Minute
 	// imdsRequestTimeout limits each request, at startup and in the background.
 	imdsRequestTimeout = 5 * time.Second
+	// vnicSubnetsMaxAge is longer than the preparation of one claim, so the
+	// RDMA NICs of a claim share one read of the VNIC subnets.
+	vnicSubnetsMaxAge = 30 * time.Second
 
 	// Oracle Cloud Agent names the RDMA fabric interfaces rdmaN.
 	rdmaNicPrefix = "rdma"
@@ -121,6 +127,15 @@ var (
 		}
 		return iface.Addrs()
 	}
+	// hostIPv4Routes lists the unicast IPv4 routes of every host table.
+	hostIPv4Routes = func() ([]netip.Prefix, error) {
+		routes, err := nlwrap.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: unix.RT_TABLE_UNSPEC}, netlink.RT_FILTER_TABLE)
+		if err != nil {
+			return nil, err
+		}
+		return unicastRoutePrefixes(routes), nil
+	}
+	kubernetesServiceHost = func() string { return os.Getenv("KUBERNETES_SERVICE_HOST") }
 )
 
 // imdsHostRDMATopologyData contains the RDMA topology fields from the
@@ -156,8 +171,9 @@ type imdsInstanceMetadata struct {
 
 // imdsVNICMetadata contains the fields used from one /opc/v2/vnics/ entry.
 type imdsVNICMetadata struct {
-	PrivateIP       string `json:"privateIp"`
-	SubnetCidrBlock string `json:"subnetCidrBlock"`
+	PrivateIP        string   `json:"privateIp"`
+	SubnetCidrBlock  string   `json:"subnetCidrBlock"`
+	SubnetCidrBlocks []string `json:"subnetCidrBlocks"`
 }
 
 // rdmaFabric describes the RDMA fabric of the instance.
@@ -230,10 +246,14 @@ type OKEInstance struct {
 	layoutValidated atomic.Bool
 	// childIPv4Range holds the child addresses. It is set once in
 	// newOKEInstance, before any other goroutine sees the instance.
-	childIPv4Range       netip.Prefix
+	childIPv4Range netip.Prefix
+	// readVNICSubnets reads the subnets of every VNIC from IMDS. It is set in
+	// start; without it the VNIC subnet check is skipped.
+	readVNICSubnets      func(context.Context) ([]netip.Prefix, error)
 	initialRetryInterval time.Duration
 	initialWait          time.Duration
 	refreshInterval      time.Duration
+	vnicSubnetsMaxAge    time.Duration
 }
 
 // Option configures an OKEInstance at construction time; see GetInstance.
@@ -291,6 +311,7 @@ func newOKEInstance(metadata *okeMetadata, fetch metadataFetcher, opts ...Option
 		initialRetryInterval: imdsInitialRetryInterval,
 		initialWait:          imdsInitialWait,
 		refreshInterval:      imdsRefreshInterval,
+		vnicSubnetsMaxAge:    vnicSubnetsMaxAge,
 	}
 	if metadata != nil {
 		instance.metadata.Store(metadata)
@@ -445,6 +466,9 @@ func (o *OKEInstance) GetProfileConfig(id cloudprovider.DeviceIdentifiers, _ *re
 	parentAddr, childAddr, err := deriveRDMAIPv4(vnic, index, parentRange, childRange)
 	if err != nil {
 		return nil, fmt.Errorf("could not derive the OKE child address for %s: %w", ifName, err)
+	}
+	if err := o.checkChildRangeConflicts(childRange); err != nil {
+		return nil, fmt.Errorf("could not use the OKE child range for %s: %w", ifName, err)
 	}
 	if err := checkParentAddress(ifName, addresses, parentAddr); err != nil {
 		return nil, err
@@ -756,6 +780,70 @@ func fetchOKEMetadata(ctx context.Context, client *http.Client, endpoint string,
 	return metadata, errors.Join(hostErr, vnicErr)
 }
 
+// parseVNICSubnets returns the IPv4 subnets of every VNIC, including the
+// secondary VNICs that VCN-native pod networking attaches for pods.
+func parseVNICSubnets(vnics []imdsVNICMetadata) []netip.Prefix {
+	var subnets []netip.Prefix
+	for _, vnic := range vnics {
+		for _, cidr := range append([]string{vnic.SubnetCidrBlock}, vnic.SubnetCidrBlocks...) {
+			if prefix, err := netip.ParsePrefix(cidr); err == nil && prefix.Addr().Is4() {
+				subnets = append(subnets, prefix.Masked())
+			}
+		}
+	}
+	return subnets
+}
+
+// unicastRoutePrefixes keeps the destinations of unicast routes. Local and
+// broadcast routes mirror addresses, and link-local routes only reach IMDS.
+func unicastRoutePrefixes(routes []netlink.Route) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, route := range routes {
+		if route.Type != unix.RTN_UNICAST || route.Dst == nil {
+			continue
+		}
+		addr, ok := netip.AddrFromSlice(route.Dst.IP)
+		ones, _ := route.Dst.Mask.Size()
+		if !ok || addr.Unmap().IsLinkLocalUnicast() {
+			continue
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr.Unmap(), ones).Masked())
+	}
+	return prefixes
+}
+
+// checkChildRangeConflicts compares the child range with the other networks
+// the node can see: every VNIC subnet, the host routes inside the range, and
+// the Kubernetes service address. It cannot see the whole pod or service CIDR,
+// so a failed read only logs a warning.
+func (o *OKEInstance) checkChildRangeConflicts(childRange netip.Prefix) error {
+	if o.readVNICSubnets != nil {
+		subnets, err := o.readVNICSubnets(context.Background())
+		if err != nil {
+			klog.Warningf("Could not read the VNIC subnets from OCI IMDS to check the child range %s: %v", childRange, err)
+		}
+		for _, subnet := range subnets {
+			if subnet.Overlaps(childRange) {
+				return fmt.Errorf("VNIC subnet %s overlaps the Dranet child range %s", subnet, childRange)
+			}
+		}
+	}
+	routes, err := hostIPv4Routes()
+	if err != nil {
+		klog.Warningf("Could not read the host routes to check the child range %s: %v", childRange, err)
+	}
+	for _, route := range routes {
+		// A wider route, like the default route, does not claim the range.
+		if route.Bits() >= childRange.Bits() && route.Overlaps(childRange) {
+			return fmt.Errorf("host route %s overlaps the Dranet child range %s", route, childRange)
+		}
+	}
+	if addr, err := netip.ParseAddr(kubernetesServiceHost()); err == nil && childRange.Contains(addr) {
+		return fmt.Errorf("the Kubernetes service address %s is inside the Dranet child range %s", addr, childRange)
+	}
+	return nil
+}
+
 // parsePrimaryVNIC returns the IPv4 data of the first entry, the primary VNIC.
 // OCA reads the same entry. It returns nil without an error when the primary
 // VNIC has no IPv4 address.
@@ -870,6 +958,30 @@ func (o *OKEInstance) start(ctx context.Context, client *http.Client, endpoint s
 		current := o.metadata.Load()
 		needVNIC := (current == nil || current.PrimaryVNIC == nil) && o.hasRDMANic()
 		return fetchOKEMetadata(ctx, client, endpoint, needVNIC)
+	}
+	// Pod VNICs attach after startup, so the child range check reads the
+	// VNIC list again instead of the cached primary VNIC. A failed read is
+	// kept too, so a slow IMDS delays a claim once, not once per RDMA NIC.
+	var (
+		vnicMu      sync.Mutex
+		vnicReadAt  time.Time
+		vnicSubnets []netip.Prefix
+		vnicErr     error
+	)
+	o.readVNICSubnets = func(ctx context.Context) ([]netip.Prefix, error) {
+		vnicMu.Lock()
+		defer vnicMu.Unlock()
+		if !vnicReadAt.IsZero() && time.Since(vnicReadAt) < o.vnicSubnetsMaxAge {
+			return vnicSubnets, vnicErr
+		}
+		var vnics []imdsVNICMetadata
+		vnicErr = queryIMDS(ctx, client, endpoint+"/vnics/", &vnics)
+		vnicSubnets = nil
+		if vnicErr == nil {
+			vnicSubnets = parseVNICSubnets(vnics)
+		}
+		vnicReadAt = time.Now()
+		return vnicSubnets, vnicErr
 	}
 	// The OCA files are static per boot. Read them once, before the RDMA NIC
 	// check, because the parent range identifies unnamed RDMA NICs.
