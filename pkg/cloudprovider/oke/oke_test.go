@@ -37,6 +37,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/klog/v2"
@@ -57,6 +58,9 @@ func fakeSysfs(t *testing.T) {
 	dir := t.TempDir()
 	originalClassNet, originalPCIDevices, originalNetnsMode := sysClassNet, sysfsPCIDevices, ibCoreNetnsModeFile
 	originalSysctl, originalOCADir, originalAddresses := procSysNetIPv4Conf, ocaConfigDir, interfaceAddresses
+	originalRoutes, originalServiceHost := hostIPv4Routes, kubernetesServiceHost
+	hostIPv4Routes = func() ([]netip.Prefix, error) { return nil, nil }
+	kubernetesServiceHost = func() string { return "" }
 	sysClassNet = filepath.Join(dir, "class", "net")
 	sysfsPCIDevices = filepath.Join(dir, "bus", "pci", "devices")
 	ibCoreNetnsModeFile = filepath.Join(dir, "module", "ib_core", "netns_mode")
@@ -81,8 +85,19 @@ func fakeSysfs(t *testing.T) {
 	t.Cleanup(func() {
 		sysClassNet, sysfsPCIDevices, ibCoreNetnsModeFile = originalClassNet, originalPCIDevices, originalNetnsMode
 		procSysNetIPv4Conf, ocaConfigDir, interfaceAddresses = originalSysctl, originalOCADir, originalAddresses
+		hostIPv4Routes, kubernetesServiceHost = originalRoutes, originalServiceHost
 		fakeAddressTable = nil
 	})
+}
+
+// prefixes parses CIDRs for fakes and expected values.
+func prefixes(t *testing.T, cidrs ...string) []netip.Prefix {
+	t.Helper()
+	var result []netip.Prefix
+	for _, cidr := range cidrs {
+		result = append(result, netip.MustParsePrefix(cidr))
+	}
+	return result
 }
 
 // fakeInterface adds an interface with the given ARPHRD type to the fake sysfs.
@@ -619,8 +634,13 @@ func TestGetProfileConfig(t *testing.T) {
 		noInterface bool
 		// childRange replaces the default child range when set.
 		childRange string
-		want       *apis.NetworkConfig
-		wantErr    string
+		// vnicSubnets, hostRoutes and serviceHost are what the child range
+		// check sees; nil vnicSubnets leaves the IMDS read unset.
+		vnicSubnets []string
+		hostRoutes  []string
+		serviceHost string
+		want        *apis.NetworkConfig
+		wantErr     string
 	}{
 		{
 			name:      "first RDMA NIC",
@@ -935,6 +955,53 @@ func TestGetProfileConfig(t *testing.T) {
 			wantErr:    "could not derive the OKE child address for rdma8: RDMA NIC index 8 with a /18 primary VNIC subnet is outside the child range 10.222.0.0/15; a /14 child range",
 		},
 		{
+			name:        "child range clear of the test cluster networks",
+			config:      profileConfig(apis.InterfaceConfig{}),
+			metadata:    ipv4Fabric(),
+			ifName:      "rdma0",
+			addresses:   []string{"10.224.13.19/12"},
+			vnicSubnets: []string{"10.140.64.0/19", "10.140.128.0/17"},
+			hostRoutes:  []string{"10.140.64.0/19", "10.140.131.213/32"},
+			serviceHost: "10.96.0.1",
+			want:        rdma0Config,
+		},
+		{
+			name:        "child range overlaps a pod VNIC subnet",
+			config:      profileConfig(apis.InterfaceConfig{}),
+			metadata:    ipv4Fabric(),
+			ifName:      "rdma0",
+			addresses:   []string{"10.224.13.19/12"},
+			vnicSubnets: []string{"10.140.64.0/19", "10.210.0.0/16"},
+			wantErr:     "could not use the OKE child range for rdma0: VNIC subnet 10.210.0.0/16 overlaps the Dranet child range 10.208.0.0/12",
+		},
+		{
+			name:       "child range overlaps a host route",
+			config:     profileConfig(apis.InterfaceConfig{}),
+			metadata:   ipv4Fabric(),
+			ifName:     "rdma0",
+			addresses:  []string{"10.224.13.19/12"},
+			hostRoutes: []string{"10.140.64.0/19", "10.212.3.0/24"},
+			wantErr:    "could not use the OKE child range for rdma0: host route 10.212.3.0/24 overlaps the Dranet child range 10.208.0.0/12",
+		},
+		{
+			name:       "host route covers the whole child range",
+			config:     profileConfig(apis.InterfaceConfig{}),
+			metadata:   ipv4Fabric(),
+			ifName:     "rdma0",
+			addresses:  []string{"10.224.13.19/12"},
+			hostRoutes: []string{"10.0.0.0/8"},
+			wantErr:    "could not use the OKE child range for rdma0: host route 10.0.0.0/8 overlaps the Dranet child range 10.208.0.0/12",
+		},
+		{
+			name:        "Kubernetes service address inside the child range",
+			config:      profileConfig(apis.InterfaceConfig{}),
+			metadata:    ipv4Fabric(),
+			ifName:      "rdma0",
+			addresses:   []string{"10.224.13.19/12"},
+			serviceHost: "10.208.0.1",
+			wantErr:     "could not use the OKE child range for rdma0: the Kubernetes service address 10.208.0.1 is inside the Dranet child range 10.208.0.0/12",
+		},
+		{
 			name:       "custom child range on the first RDMA NIC",
 			config:     profileConfig(apis.InterfaceConfig{}),
 			metadata:   ipv4Fabric(),
@@ -1143,6 +1210,13 @@ func TestGetProfileConfig(t *testing.T) {
 			if tt.ocaConfig != nil {
 				instance.ocaConfig = *tt.ocaConfig
 			}
+			if tt.vnicSubnets != nil {
+				subnets := prefixes(t, tt.vnicSubnets...)
+				instance.readVNICSubnets = func(context.Context) ([]netip.Prefix, error) { return subnets, nil }
+			}
+			routes := prefixes(t, tt.hostRoutes...)
+			hostIPv4Routes = func() ([]netip.Prefix, error) { return routes, nil }
+			kubernetesServiceHost = func() string { return tt.serviceHost }
 			id := cloudprovider.DeviceIdentifiers{Name: tt.ifName, PCIAddress: "0000:0c:00.0", MAC: tt.mac}
 			got, err := instance.GetProfileConfig(id, nil, tt.config)
 			if tt.wantErr != "" {
@@ -3035,5 +3109,118 @@ func TestStartWarnsInExclusiveNetnsMode(t *testing.T) {
 	klog.Flush()
 	if want := "exclusive network namespace mode"; !strings.Contains(logs.String(), want) {
 		t.Errorf("start() logged %q, want it to contain %q", logs.String(), want)
+	}
+}
+
+func TestParseVNICSubnets(t *testing.T) {
+	tests := []struct {
+		name  string
+		vnics []imdsVNICMetadata
+		want  []netip.Prefix
+	}{
+		{name: "no VNICs"},
+		{name: "primary VNIC", vnics: []imdsVNICMetadata{{SubnetCidrBlock: "10.140.64.0/19"}}, want: prefixes(t, "10.140.64.0/19")},
+		{
+			name:  "primary and pod VNICs",
+			vnics: []imdsVNICMetadata{{SubnetCidrBlock: "10.140.64.0/19"}, {SubnetCidrBlock: "10.140.128.0/17"}, {SubnetCidrBlock: "10.140.128.0/17"}},
+			want:  prefixes(t, "10.140.64.0/19", "10.140.128.0/17", "10.140.128.0/17"),
+		},
+		{
+			name:  "extra subnet CIDR blocks",
+			vnics: []imdsVNICMetadata{{SubnetCidrBlock: "10.0.3.0/24", SubnetCidrBlocks: []string{"10.0.3.0/24", "172.16.3.0/24"}}},
+			want:  prefixes(t, "10.0.3.0/24", "10.0.3.0/24", "172.16.3.0/24"),
+		},
+		{name: "unmasked subnet", vnics: []imdsVNICMetadata{{SubnetCidrBlock: "10.140.77.19/19"}}, want: prefixes(t, "10.140.64.0/19")},
+		{
+			name:  "IPv6, empty and invalid subnets are skipped",
+			vnics: []imdsVNICMetadata{{SubnetCidrBlocks: []string{"fd23::/64", "garbage"}}, {SubnetCidrBlock: "10.140.64.0/19"}},
+			want:  prefixes(t, "10.140.64.0/19"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if diff := cmp.Diff(tt.want, parseVNICSubnets(tt.vnics), cmp.Comparer(func(a, b netip.Prefix) bool { return a == b })); diff != "" {
+				t.Errorf("parseVNICSubnets() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestUnicastRoutePrefixes(t *testing.T) {
+	ipNet := func(cidr string) *net.IPNet {
+		ip, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			t.Fatalf("ParseCIDR(%q) returned error: %v", cidr, err)
+		}
+		return &net.IPNet{IP: ip, Mask: ipNet.Mask}
+	}
+	routes := []netlink.Route{
+		{Type: unix.RTN_UNICAST, Dst: ipNet("10.140.64.0/19")},
+		{Type: unix.RTN_UNICAST, Dst: ipNet("10.140.131.213/32")},
+		// A 16-byte IPv4 address, as some netlink paths return it.
+		{Type: unix.RTN_UNICAST, Dst: &net.IPNet{IP: net.ParseIP("10.240.3.0"), Mask: net.CIDRMask(24, 32)}},
+		{Type: unix.RTN_UNICAST, Dst: ipNet("10.212.3.7/24")},
+		{Type: unix.RTN_UNICAST},
+		{Type: unix.RTN_UNICAST, Dst: ipNet("0.0.0.0/0")},
+		{Type: unix.RTN_UNICAST, Dst: ipNet("169.254.0.0/16")},
+		{Type: unix.RTN_LOCAL, Dst: ipNet("10.140.79.155/32")},
+		{Type: unix.RTN_BROADCAST, Dst: ipNet("10.140.95.255/32")},
+	}
+	want := prefixes(t, "10.140.64.0/19", "10.140.131.213/32", "10.240.3.0/24", "10.212.3.0/24")
+	if diff := cmp.Diff(want, unicastRoutePrefixes(routes), cmp.Comparer(func(a, b netip.Prefix) bool { return a == b })); diff != "" {
+		t.Errorf("unicastRoutePrefixes() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// A failed read skips that part of the check; the other parts still run.
+func TestCheckChildRangeConflictsReadErrors(t *testing.T) {
+	fakeSysfs(t)
+	childRange := netip.MustParsePrefix("10.208.0.0/12")
+	instance := newOKEInstance(nil, nil)
+	instance.readVNICSubnets = func(context.Context) ([]netip.Prefix, error) { return nil, errors.New("IMDS is down") }
+	hostIPv4Routes = func() ([]netip.Prefix, error) { return nil, errors.New("dump interrupted") }
+	if err := instance.checkChildRangeConflicts(childRange); err != nil {
+		t.Fatalf("checkChildRangeConflicts() error = %v, want nil after read errors", err)
+	}
+	for _, host := range []string{"", "not-an-address", "10.96.0.1"} {
+		kubernetesServiceHost = func() string { return host }
+		if err := instance.checkChildRangeConflicts(childRange); err != nil {
+			t.Errorf("checkChildRangeConflicts() with service host %q error = %v, want nil", host, err)
+		}
+	}
+	kubernetesServiceHost = func() string { return "10.223.255.254" }
+	if err := instance.checkChildRangeConflicts(childRange); err == nil || !strings.Contains(err.Error(), "the Kubernetes service address 10.223.255.254 is inside") {
+		t.Errorf("checkChildRangeConflicts() error = %v, want the service address error after read errors", err)
+	}
+}
+
+// start wires the IMDS read, so each claim sees VNICs attached after startup.
+func TestStartReadsVNICSubnetsPerClaim(t *testing.T) {
+	fakeSysfs(t)
+	fakeInterface(t, "rdma0", "0000:0c:00.0", unix.ARPHRD_ETHER)
+	requests := newRDMANodeRequests()
+	server := rdmaNodeServer(t, requests, serveVNIC, func(w http.ResponseWriter) {
+		_, _ = w.Write([]byte(`[{"privateIp":"10.140.77.19","subnetCidrBlock":"10.140.64.0/19"},{"privateIp":"10.140.200.171","subnetCidrBlock":"10.140.128.0/17"}]`))
+	})
+
+	instance := newOKEInstance(nil, nil)
+	instance.initialRetryInterval = time.Millisecond
+	instance.initialWait = time.Second
+	instance.refreshInterval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := instance.start(ctx, server.Client(), server.URL); err != nil {
+		t.Fatalf("start() returned error: %v", err)
+	}
+	got, err := instance.readVNICSubnets(ctx)
+	if err != nil {
+		t.Fatalf("readVNICSubnets() returned error: %v", err)
+	}
+	want := prefixes(t, "10.140.64.0/19", "10.140.128.0/17")
+	if diff := cmp.Diff(want, got, cmp.Comparer(func(a, b netip.Prefix) bool { return a == b })); diff != "" {
+		t.Errorf("readVNICSubnets() mismatch (-want +got):\n%s", diff)
+	}
+	if got := requests["/vnics/"].Load(); got != 2 {
+		t.Errorf("vnics endpoint requested %d times, want 2 (startup and the claim check)", got)
 	}
 }
